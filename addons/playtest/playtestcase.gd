@@ -324,6 +324,53 @@ func _heartbeat_interval() -> int:
 			_heartbeat_interval_ms = 5000
 	return _heartbeat_interval_ms
 
+## Suite budget (ADR-0009, ticket #12): `PLAYTEST_SUITE_TIMEOUT_SECONDS`,
+## unset = off. Static — like `PlaytestClient`'s per-invocation bookkeeping —
+## because the deadline must survive the disposable per-test `PlaytestCase`
+## instances: the runner arms it once in its `_ready()` (`_suite_deadline_ms`
+## = absolute wall-clock deadline, `_suite_budget_s` = the env value, used in
+## the expiry line) and refreshes `_suite_test_label` (the `<file> :: <method>`
+## of the test currently running) before every test. `_suite_expired` makes
+## the expiry fire exactly once: the deadline is re-checked every frame
+## (runner `_process`, wait-loop ticks) and only the first check past the
+## deadline may print.
+static var _suite_deadline_ms := 0
+static var _suite_budget_s := 0
+static var _suite_test_label := ""
+static var _suite_expired := false
+
+## The shared suite-budget check (ADR-0009, ticket #12): the deadline is
+## enforced from two places — the runner's own per-frame `_process` tick
+## (which covers the gaps between tests and every wait that never reaches
+## `_heartbeat_tick`, like a hung `attach_instance` port-file poll) and the
+## heartbeat tick below (the wait loops' shared check). Returns whether the
+## budget has expired: the expiry itself only prints the distinct line and
+## sets the flag — quitting is left to the runner's own execution points
+## (post-test / between-tests), because `get_tree().quit()` while the
+## runner's `_ready` coroutine is suspended would leak every in-flight
+## coroutine state (Godot abandons suspended states at exit) and bury the
+## expiry line under teardown noise. The cooperative aborts in the wait
+## loops and `PlaytestClient`'s poll loops unwind the running test within
+## the same frame, so the quit is still immediate in practice.
+static func _check_suite_budget() -> bool:
+	if _suite_deadline_ms > 0 and Time.get_ticks_msec() >= _suite_deadline_ms:
+		_expire_suite_budget()
+	return _suite_expired
+
+## The one suite-budget expiry (ADR-0009, ticket #12): prints the distinct
+## `[playtest-runner] suite budget exceeded (<budget>s) while running
+## <file> :: <method>` line — distinguishable from an ordinary test failure
+## by any parser — and records the flag that makes the runner quit 1 at its
+## next execution point. Idempotent: exactly one line per expired budget,
+## even though the deadline is re-checked every frame. The runner quits
+## before printing anything else for the cut-off test — no `ok`/`FAIL` line,
+## no failure details, no summary report after the expiry.
+static func _expire_suite_budget() -> void:
+	if _suite_expired:
+		return
+	_suite_expired = true
+	print("[playtest-runner] suite budget exceeded (%ds) while running %s" % [_suite_budget_s, _suite_test_label])
+
 ## The shared heartbeat tick (spec #9, ticket #11): called once per poll-loop
 ## iteration of `wait_for`, `time_step_until`, `assert_eventually_property`,
 ## and the `assert_eventually_*` core. Emits one
@@ -344,9 +391,11 @@ func _heartbeat_interval() -> int:
 ## piped terminal and adds no `WARNING:` prefix and no backtrace (verified on
 ## Godot 4.6.3 — `push_warning` does both and is unusable here). This
 ## function is also the seam ADR-0009's suite-budget deadline check
-## (ticket #12) will extend: every poll loop funnels through here, so a
-## check added in this one place covers all four wait families at once.
+## (ticket #12) extends: every poll loop funnels through here, so the check
+## added in this one place covers all four wait families at once — each
+## loop then only needs its one-line `_suite_expired` abort after the call.
 func _heartbeat_tick(state: Dictionary, label: String, elapsed_label: String, total_label: String) -> void:
+	_check_suite_budget()
 	if not state.has("heartbeat_at_ms"):
 		# First tick of this wait: anchor the interval, stay silent — the
 		# threshold counts from the wait's start, not per-iteration (a
@@ -405,6 +454,11 @@ func wait_for(selector: Dictionary, opts: Dictionary = {}) -> Node:
 		_heartbeat_tick(state, condition_label,
 			"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
 			_seconds_label(timeout_ms))
+		if _suite_expired:
+			# Suite budget exceeded mid-wait (ADR-0009): the expiry line is
+			# the report — return silently, the runner quits before it
+			# prints anything for this test.
+			return null
 		await get_tree().process_frame
 	return null
 
@@ -487,6 +541,10 @@ func time_step_until(selector: Dictionary, opts: Dictionary = {}) -> Dictionary:
 			_aborted = true
 			return {"node": null, "frames": elapsed}
 		_heartbeat_tick(state, condition_label, "%d" % elapsed, "%d frames" % max_frames)
+		if _suite_expired:
+			# Suite budget exceeded mid-wait (ADR-0009): silent abort — the
+			# runner quits before it prints anything for this test.
+			return {"node": null, "frames": elapsed}
 		await get_tree().process_frame
 	return {"node": null, "frames": 0}
 
@@ -668,6 +726,10 @@ func assert_eventually_property(selector: Dictionary, property: String, expected
 			_heartbeat_tick(heartbeat_state, condition_label,
 				"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
 				_seconds_label(timeout_ms))
+			if _suite_expired:
+				# Suite budget exceeded mid-wait (ADR-0009): silent abort —
+				# the runner quits before it prints anything for this test.
+				return
 			await get_tree().process_frame
 			continue
 		if Time.get_ticks_msec() >= deadline_ms:
@@ -677,6 +739,8 @@ func assert_eventually_property(selector: Dictionary, property: String, expected
 		_heartbeat_tick(heartbeat_state, condition_label,
 			"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
 			_seconds_label(timeout_ms))
+		if _suite_expired:
+			return
 		await get_tree().process_frame
 
 ## Core shared by `assert_now_eq`/`assert_now_true`/`assert_now_false`/
@@ -726,6 +790,10 @@ func _assert_eventually(actual: Variant, ok: Callable, describe: Callable, own_k
 		_heartbeat_tick(heartbeat_state, own_kind,
 			"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
 			_seconds_label(timeout_ms))
+		if _suite_expired:
+			# Suite budget exceeded mid-wait (ADR-0009): silent abort — the
+			# runner quits before it prints anything for this test.
+			return
 		await get_tree().process_frame
 
 func _assert_message(kind: String, message: String, detail: String) -> String:

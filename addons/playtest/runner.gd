@@ -20,6 +20,11 @@
 ##   or if `--suite` names a path that does not resolve — the default
 ##   `res://playtests/` included, since the rule is about resolving what was
 ##   named, not about who named it;
+## - nonzero if the suite exceeds the `PLAYTEST_SUITE_TIMEOUT_SECONDS`
+##   budget (ADR-0009, ticket #12 — unset = off): the runner prints the
+##   distinct `suite budget exceeded (Ns) while running <file> :: <method>`
+##   line naming the test that was executing and quits 1, fast, instead of
+##   letting cascading timeouts burn on;
 ## - zero if every test passed, including when an existing suite directory
 ##   holds no `.gd` file at all.
 extends Node
@@ -29,6 +34,7 @@ const PlaytestCaseScript = preload("res://addons/playtest/playtestcase.gd")
 func _ready() -> void:
 	var args := _parse_args(OS.get_cmdline_user_args())
 	var suite_path: String = args.get("suite", "res://playtests/")
+	_arm_suite_budget()
 
 	var discovery := _discover(suite_path)
 	if not discovery["error"].is_empty():
@@ -59,6 +65,16 @@ func _ready() -> void:
 			continue
 		for method_name in _test_methods(script):
 			total += 1
+			# ADR-0009 enforcement point "between tests": the suite deadline
+			# is re-checked at the start of every test's turn, so the budget
+			# trips even if the previous test returned right at the deadline
+			# (the check names that test — the last one that was running).
+			# The label guard mirrors `_process`: nothing to name, no expiry
+			# (the first test's own wait-loop tick catches a deadline that
+			# passed during discovery).
+			if not PlaytestCase._suite_test_label.is_empty() and PlaytestCase._check_suite_budget():
+				get_tree().quit(1)
+				return
 			# Reset before every test (spec #66): a prior test's time_scale()
 			# on instance 0 must never leak into the next one — instances
 			# 1..N are naturally immune (a separate OS process each), so this
@@ -67,9 +83,22 @@ func _ready() -> void:
 			var case: PlaytestCase = script.new()
 			add_child(case)
 			case._reset_report()
+			PlaytestCase._suite_test_label = "%s :: %s" % [script_path, method_name]
 			print("→ %s :: %s" % [script_path, method_name])
 			var started_ms := Time.get_ticks_msec()
 			await case.callv(method_name, [])
+			if PlaytestCase._check_suite_budget():
+				# The budget blew mid-test (ADR-0009): the wait loops and
+				# client poll loops aborted this test cooperatively, and the
+				# expiry line — printed by the first check past the
+				# deadline — is the whole report: no ok/FAIL, no failure
+				# details, no summary. Clean up this test exactly like the
+				# normal path, then quit 1 from here, where `_ready` is
+				# executing and no coroutine state is left suspended.
+				remove_child(case)
+				case.queue_free()
+				get_tree().quit(1)
+				return
 			var elapsed_s := (Time.get_ticks_msec() - started_ms) / 1000.0
 			if case.failures.is_empty():
 				print("  ok (%.1fs)" % elapsed_s)
@@ -83,6 +112,14 @@ func _ready() -> void:
 			remove_child(case)
 			case.queue_free()
 
+	# The suite's own work is done: nothing is "running" anymore, so the
+	# budget is disarmed — a deadline passing in the report epilogue (a
+	# sub-frame window after the last test's own check) lets the suite
+	# report normally, and the quit path below is already taken. A hang in
+	# the report or quit epilogue stays the external harness's job, as
+	# always (ADR-0009).
+	PlaytestCase._suite_test_label = ""
+
 	# Best-effort `quit` to every attached instance this whole invocation
 	# ever connected to (spec #66 §53) — once, here, never per-test (a
 	# handle's process is launched once by the harness for the life of the
@@ -92,6 +129,34 @@ func _ready() -> void:
 	print("")
 	print("[playtest-runner] %d test(s), %d failure(s)" % [total, failed])
 	get_tree().quit(1 if failed > 0 else 0)
+
+## Arms the suite budget (ADR-0009, ticket #12): reads
+## `PLAYTEST_SUITE_TIMEOUT_SECONDS` once per invocation (unset, empty, or
+## non-positive = off) and stores the absolute wall-clock deadline on the
+## shared `PlaytestCase` statics — the single source of truth for both this
+## runner's per-frame tick and every wait loop's heartbeat tick.
+func _arm_suite_budget() -> void:
+	var budget_s := int(OS.get_environment("PLAYTEST_SUITE_TIMEOUT_SECONDS"))
+	if budget_s <= 0:
+		return
+	PlaytestCase._suite_deadline_ms = Time.get_ticks_msec() + budget_s * 1000
+	PlaytestCase._suite_budget_s = budget_s
+	PlaytestCase._suite_expired = false
+
+## ADR-0009 enforcement point "in its own `_process`": fires every frame the
+## runner is alive, so the budget trips even while a test is suspended
+## inside a wait that never reaches `_heartbeat_tick` — the multi-client
+## `attach_instance` port-file/connect polls and every `PlaytestClient`
+## round trip included — and in the gaps between tests. The shared
+## `PlaytestCase._check_suite_budget()` prints the expiry line and sets the
+## flag; the running test's own poll loops then abort cooperatively and the
+## runner quits at its next execution point (see the suite loop above). A
+## per-frame no-op while no test is running (discovery, or after the suite
+## disarmed the label).
+func _process(_delta: float) -> void:
+	if PlaytestCase._suite_test_label.is_empty():
+		return
+	PlaytestCase._check_suite_budget()
 
 func _parse_args(user_args: PackedStringArray) -> Dictionary:
 	var out := {}
