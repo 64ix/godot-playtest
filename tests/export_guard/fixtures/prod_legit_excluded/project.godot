@@ -1,0 +1,10 @@
+config_version=5
+
+[application]
+
+config/name="fixture-prod-legit-excluded"
+config/features=PackedStringArray("4.6")
+
+[autoload]
+
+TestBridge="*res://addons/playtest/bridge.gd"

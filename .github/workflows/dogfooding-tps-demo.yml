@@ -1,0 +1,63 @@
+name: dogfooding-tps-demo
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dogfood-golden-path:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Provision Godot 4.6.3 (standard, linux x86_64)
+        run: bash .github/scripts/provision-godot.sh
+
+      # Caches the instrumented tps-demo clone AND its .godot/imported/ (the
+      # latter lives under the former, see setup-tps-demo.sh): `--depth 1`
+      # doesn't limit the assets (~800 MB of glTF/HDR textures), and the
+      # first `--import` takes several minutes (dogfooding/FRICTIONS.md #5).
+      # A warm cache restores both at once: the setup step below becomes a
+      # no-op (clone already present) and the import a near-instant no-op.
+      # Key tied to the setup script + instrumentation patch, never to the
+      # repo's application code: if either changes, the clone's expected
+      # content changes too, so we start from a fresh clone rather than
+      # reuse a potentially inconsistent cache. Deliberately WITHOUT
+      # `restore-keys`: a prefix fallback would restore a clone already
+      # patched with the OLD version of the patch as soon as it changes,
+      # and `setup-tps-demo.sh` (git apply --check on a tree already
+      # modified differently) would fail cleanly but wrongly — we want a
+      # genuinely fresh clone in that case, not an inconsistent partial
+      # restore.
+      - name: Cache instrumented tps-demo clone + imports
+        id: cache-tps-demo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .dogfood/tps-demo
+          key: dogfooding-tps-demo-godot4.6.3-${{ hashFiles('dogfooding/setup-tps-demo.sh', 'dogfooding/patches/**') }}
+
+      - name: Setup instrumented clone (clone if absent, addon + patch reapplied)
+        run: ./dogfooding/setup-tps-demo.sh
+
+      - name: Import pass (near-instant if cache is warm, several minutes if cold)
+        run: |
+          echo "cache-hit=${{ steps.cache-tps-demo.outputs.cache-hit }}"
+          time ./godot-bin --headless --path .dogfood/tps-demo --import || true
+
+      - name: Copy the dogfooding frozen test into the clone
+        run: |
+          mkdir -p .dogfood/tps-demo/playtests
+          cp dogfooding/playtests/*.gd .dogfood/tps-demo/playtests/
+
+      - name: "Dogfooding frozen test (res://playtests/): the runner's exit code is authoritative"
+        run: |
+          echo "cache-hit=${{ steps.cache-tps-demo.outputs.cache-hit }}"
+          time ./godot-bin --headless --path .dogfood/tps-demo res://addons/playtest/runner.tscn -- --suite=res://playtests/

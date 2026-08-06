@@ -1,0 +1,74 @@
+name: release-mcp-server
+
+# Publishes godot-playtest-mcp to npm on a version tag (spec #32, criterion
+# #5). Inert until the maintainer configures the NPM_TOKEN repository
+# secret: the very first step fails loudly instead of letting a later step
+# attempt an unauthenticated `npm publish`. A second guard refuses a tag that
+# disagrees with `mcp-server/package.json`'s version, since `npm publish`
+# ships what package.json says and not what the tag is named — publishing
+# 0.2.0 under a v0.3.0 tag would be permanent. See docs/RELEASE.md for the
+# human-only steps (npm account/token, Asset Library submission) this
+# workflow does not and cannot automate.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Require NPM_TOKEN (inert until the maintainer configures it)
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::error::NPM_TOKEN repository secret is not set. Add an npm automation token as the NPM_TOKEN secret before tagging a release — refusing to attempt an unauthenticated 'npm publish'. See docs/RELEASE.md."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Require the tag to match mcp-server/package.json version
+        working-directory: mcp-server
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match mcp-server/package.json version ${pkg_version}. Publishing would ship ${pkg_version} under tag ${GITHUB_REF_NAME}, and an npm version can never be republished. Use 'npm version' so both move together. See docs/RELEASE.md."
+            exit 1
+          fi
+
+      - name: Provision Godot 4.6.3 (standard, linux x86_64)
+        run: bash .github/scripts/provision-godot.sh
+
+      - name: Import pass (first open of the project)
+        run: ./godot-bin --headless --path . --import || true
+
+      - name: Install, build, test (unit + integration, incl. the packaged-binary smoke test)
+        working-directory: mcp-server
+        env:
+          GODOT_BIN: ${{ github.workspace }}/godot-bin
+        run: |
+          npm ci
+          npm run build
+          npm test
+          npm run test:integration
+
+      - name: Publish to npm
+        working-directory: mcp-server
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish

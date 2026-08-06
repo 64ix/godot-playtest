@@ -1,0 +1,44 @@
+name: bridge-conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  headless-x20:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Provision Godot 4.6.3 (standard, linux x86_64)
+        run: bash .github/scripts/provision-godot.sh
+
+      - name: Import pass (first open of the project)
+        run: ./godot-bin --headless --path . --import || true
+
+      - name: Conformance suite (hello, query, selectors, errors) ×20
+        run: |
+          set -e
+          pass=0
+          for i in $(seq 1 20); do
+            t0=$(date +%s.%N)
+            out=$(python3 tests/conformance/scenario.py ./godot-bin . 4242)
+            t1=$(date +%s.%N)
+            echo "run $i: $out (wall $(echo "$t1 - $t0" | bc)s)"
+            pass=$((pass + 1))
+          done
+          echo "PASS $pass/20"
+
+      - name: Transport liveness guard — _pending purged, Transport.send no-op (#21)
+        run: ./godot-bin --headless --path . --script res://tests/conformance/transport_liveness_test.gd
+
+      - name: Selector suggestion similarity floor — close/far/empty (#33)
+        run: ./godot-bin --headless --path . --script res://tests/conformance/selector_suggestions_test.gd

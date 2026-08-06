@@ -1,0 +1,6 @@
+node_modules/
+dist/
+
+# Copied from the repo root by the "prepack" script (scripts/copy-license.mjs)
+# so the published tarball carries a license file — not the source of truth.
+LICENSE

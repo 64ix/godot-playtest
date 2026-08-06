@@ -1,0 +1,43 @@
+#!/bin/sh
+# Refuses to push a `v*` tag unless ALLOW_RELEASE_TAG=1 is set.
+#
+# Pushing a `v*` tag is the sole trigger of
+# .github/workflows/release-mcp-server.yml, which runs `npm publish`. A
+# published npm version can never be overwritten, and cannot be unpublished
+# after 72 hours — a mistaken release is permanent (docs/RELEASE.md).
+# Cutting a release is a deliberate human act, so make the accidental path
+# loud rather than silent.
+#
+# This inspects the refs being pushed rather than the command line, so every
+# spelling is covered: `--tags`, `--follow-tags`, and a bare
+# `git push origin v0.2.0`.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+
+[ "$ALLOW_RELEASE_TAG" = "1" ] && exit 0
+
+blocked=""
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+	case "$remote_ref" in
+	refs/tags/v*)
+		blocked="$blocked  $remote_ref
+"
+		;;
+	esac
+done
+
+[ -z "$blocked" ] && exit 0
+
+printf 'pre-push: refusing to push release tag(s):\n%s\n' "$blocked" >&2
+cat >&2 <<'EOF'
+A v* tag triggers release-mcp-server.yml, which runs `npm publish`. npm never
+lets a published version be overwritten, and refuses to unpublish after 72
+hours, so this cannot be undone.
+
+If you really mean to cut a release:
+
+  ALLOW_RELEASE_TAG=1 git push --follow-tags
+
+See docs/RELEASE.md.
+EOF
+exit 1

@@ -1,0 +1,12 @@
+.godot/
+*.import
+export_presets.cfg
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Dogfooding (issue #14): local clone of the instrumented tps-demo "fork",
+# produced by dogfooding/setup-tps-demo.sh — never committed (large,
+# reproducible from the versioned patch).
+/.dogfood/

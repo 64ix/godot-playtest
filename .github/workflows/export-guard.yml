@@ -1,0 +1,31 @@
+name: export-guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-guard-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Provision Godot 4.6.3 (standard, linux x86_64)
+        run: bash .github/scripts/provision-godot.sh
+
+      - name: Import pass (first open of the project)
+        run: ./godot-bin --headless --path . --import || true
+
+      - name: Export guard — fixtures (instrumented prod fails, legitimate passes)
+        run: python3 tests/export_guard/test_export_guard.py ./godot-bin .
+
+      - name: Activation policy — release without feature refused, otherwise starts
+        run: ./godot-bin --headless --path . --script res://tests/export_guard/activation_policy_test.gd
