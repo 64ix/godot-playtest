@@ -242,9 +242,13 @@ func invoke(selector: Dictionary, method: String, args: Array = []) -> Variant:
 ## each in-process call is itself the failure site). `state` persists
 ## `signal` mode's connection bookkeeping (`connected`/`fired`) across calls —
 ## a `Dictionary`, passed by reference, since a plain local would reset every
-## loop iteration. Returns `{"failed": true}` for an immediate, already-recorded
-## failure (ambiguous/bad_request selector, or a missing method/signal — none
-## of which resolve themselves with more time or more steps), `{"node": Node}`
+## loop iteration — and, since spec #9 ticket #10, the last observation
+## (`last_value` in property/method mode, `last_error` while the selector
+## stays unresolved, cleared again once it resolves) so a timeout can name
+## what the poll loop saw without re-reading at the deadline. Returns
+## `{"failed": true}` for an immediate, already-recorded failure
+## (ambiguous/bad_request selector, or a missing method/signal — none of
+## which resolve themselves with more time or more steps), `{"node": Node}`
 ## once the condition is met, or `{}` while it isn't yet (including a
 ## "not_found" selector, which may still resolve later).
 func _check_condition(selector: Dictionary, mode: String, opts: Dictionary, verb: String, state: Dictionary) -> Dictionary:
@@ -253,13 +257,16 @@ func _check_condition(selector: Dictionary, mode: String, opts: Dictionary, verb
 		if res["error"] == "ambiguous" or res["error"] == "bad_request":
 			_record_selector_failure("%s(%s)" % [verb, selector], res)
 			return {"failed": true}
+		state["last_error"] = {"error": res["error"], "detail": res["detail"]}
 		return {}
 	var node: Node = res["node"]
+	state["last_error"] = {}
 	match mode:
 		"plain":
 			return {"node": node}
 		"property":
 			var actual = node.get(String(opts["property"]))
+			state["last_value"] = PlaytestVariantJson.to_json(actual)
 			if actual == opts.get("equals"):
 				return {"node": node}
 		"method":
@@ -274,6 +281,7 @@ func _check_condition(selector: Dictionary, mode: String, opts: Dictionary, verb
 				_aborted = true
 				return {"failed": true}
 			var value = node.callv(method_name, opts.get("args", []))
+			state["last_value"] = PlaytestVariantJson.to_json(value)
 			if value == opts.get("equals"):
 				return {"node": node}
 		"signal":
@@ -288,6 +296,16 @@ func _check_condition(selector: Dictionary, mode: String, opts: Dictionary, verb
 			if state.get("fired", false):
 				return {"node": node}
 	return {}
+
+## The Condition (CONTEXT.md glossary) as one Dictionary — the Selector plus
+## the mode and comparison keys from `opts`, bookkeeping keys included (the
+## shared descriptor filters them). What timeout messages name (spec #9,
+## ticket #10).
+func _condition_spec(selector: Dictionary, opts: Dictionary) -> Dictionary:
+	var spec := selector.duplicate()
+	for key in opts:
+		spec[key] = opts[key]
+	return spec
 
 ## Asynchronous `wait_for` (§4, §1.3): re-evaluates the condition every frame
 ## (`await get_tree().process_frame`) until resolution or `timeout_ms` —
@@ -316,7 +334,11 @@ func wait_for(selector: Dictionary, opts: Dictionary = {}) -> Node:
 		if res.has("node"):
 			return res["node"]
 		if Time.get_ticks_msec() >= deadline_ms:
-			_record_failure("wait_for(%s) timed out after %dms" % [selector, timeout_ms])
+			_record_failure("wait_for(%s) timed out after %dms — %s" % [
+				selector, timeout_ms,
+				PlaytestConditions.timeout_tail(_condition_spec(selector, opts), mode,
+					state.get("last_value"), state.get("last_error", {})),
+			])
 			_aborted = true
 			return null
 		await get_tree().process_frame
@@ -384,11 +406,19 @@ func time_step_until(selector: Dictionary, opts: Dictionary = {}) -> Dictionary:
 		if res.has("node"):
 			return {"node": res["node"], "frames": elapsed}
 		if elapsed >= max_frames:
-			_record_failure("time_step_until(%s) exhausted its frame budget (max_frames=%d) after %d frame(s)" % [selector, max_frames, elapsed])
+			_record_failure("time_step_until(%s) exhausted its frame budget (max_frames=%d) after %d frame(s) — %s" % [
+				selector, max_frames, elapsed,
+				PlaytestConditions.timeout_tail(_condition_spec(selector, opts), mode,
+					state.get("last_value"), state.get("last_error", {})),
+			])
 			_aborted = true
 			return {"node": null, "frames": elapsed}
 		if deadline_ms >= 0 and Time.get_ticks_msec() >= deadline_ms:
-			_record_failure("time_step_until(%s) exceeded its 'timeout_ms' safety ceiling after %d frame(s)" % [selector, elapsed])
+			_record_failure("time_step_until(%s) exceeded its 'timeout_ms' safety ceiling after %d frame(s) — %s" % [
+				selector, elapsed,
+				PlaytestConditions.timeout_tail(_condition_spec(selector, opts), mode,
+					state.get("last_value"), state.get("last_error", {})),
+			])
 			_aborted = true
 			return {"node": null, "frames": elapsed}
 		await get_tree().process_frame

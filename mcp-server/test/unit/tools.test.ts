@@ -108,7 +108,16 @@ test("act_invoke tool maps to cmd='act.invoke' with method/args", async () => {
 test("wait_for tool maps to cmd='wait_for' and surfaces timeout errors, not swallowed", async () => {
   const { client } = await setup({
     wait_for: (req, respond) => {
-      respond({ id: req["id"], ok: false, error: "timeout", detail: "wait_for timed out after 300ms" });
+      respond({
+        id: req["id"],
+        ok: false,
+        error: "timeout",
+        // Ticket #10: the detail names the full Condition and the last
+        // observation, appended after the existing prefix.
+        detail:
+          "wait_for timed out after 300ms — condition: {\"test_id\":\"no_such_thing\"}; " +
+          "last error: not_found no node with test_id 'no_such_thing'",
+      });
     },
   });
   const result = await client!.callTool({
@@ -118,7 +127,11 @@ test("wait_for tool maps to cmd='wait_for' and surfaces timeout errors, not swal
   assert.equal(result.isError, true);
   const payload = parseResultText(result);
   assert.equal(payload["error"], "timeout");
-  assert.equal(payload["detail"], "wait_for timed out after 300ms");
+  assert.equal(
+    payload["detail"],
+    "wait_for timed out after 300ms — condition: {\"test_id\":\"no_such_thing\"}; " +
+      "last error: not_found no node with test_id 'no_such_thing'",
+  );
 });
 
 test("not_found errors carry their suggestions through the tool result, not just ok=false", async () => {

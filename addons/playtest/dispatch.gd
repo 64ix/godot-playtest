@@ -309,19 +309,28 @@ func _wait_for(id, req: Dictionary, peer) -> Variant:
 ## of which resolve themselves with more time or more steps), `{"node": Node}`
 ## once the condition is met, or `{}` while it isn't yet (including a
 ## "not_found" selector, which may still resolve later).
+##
+## Side effects on `entry` (spec #9, ticket #10): the last observation is
+## carried out of the poll loop so a timeout can name it — `last_value` in
+## property/method mode, `last_error` while the selector stays unresolved
+## (cleared again once it resolves, so the two never conflict). No re-read at
+## the deadline.
 func _check_condition(entry: Dictionary) -> Dictionary:
 	var sel_res := _resolve_selector(entry["id"], entry["selector"])
 	if sel_res.has("error"):
 		var err: Dictionary = sel_res["error"]
 		if err["error"] == PlaytestErrors.AMBIGUOUS or err["error"] == PlaytestErrors.BAD_REQUEST:
 			return {"error": err}
+		entry["last_error"] = {"error": err["error"], "detail": err["detail"]}
 		return {}
 	var node: Node = sel_res["node"]
+	entry["last_error"] = {}
 	match entry["mode"]:
 		"plain":
 			return {"node": node}
 		"property":
 			var actual = PlaytestVariantJson.to_json(node.get(entry["property"]))
+			entry["last_value"] = actual
 			if actual == entry["equals"]:
 				return {"node": node}
 		"method":
@@ -329,6 +338,7 @@ func _check_condition(entry: Dictionary) -> Dictionary:
 				return {"error": PlaytestErrors.bad_request(
 					entry["id"], "node has no method '%s'" % entry["method"])}
 			var value = PlaytestVariantJson.to_json(node.callv(entry["method"], entry["args"]))
+			entry["last_value"] = value
 			if value == entry["equals"]:
 				return {"node": node}
 		"signal":
@@ -351,7 +361,12 @@ func _poll_wait_for(entry: Dictionary) -> Variant:
 		return {"id": entry["id"], "ok": true, "node": PlaytestState.describe(res["node"])}
 	if Time.get_ticks_msec() >= entry["deadline_ms"]:
 		return PlaytestErrors.timeout(
-			entry["id"], "wait_for timed out after %dms" % entry["timeout_ms"])
+			entry["id"],
+			"wait_for timed out after %dms — %s" % [
+				entry["timeout_ms"],
+				PlaytestConditions.timeout_tail(entry["selector"], entry["mode"],
+					entry.get("last_value"), entry.get("last_error", {})),
+			])
 	return null
 
 ## Registers a pending `time.step_until` (ticket #37, §4): deterministic
@@ -413,12 +428,21 @@ func _poll_step_until(entry: Dictionary) -> Variant:
 	if elapsed >= entry["max_frames"]:
 		var budget_err := PlaytestErrors.timeout(
 			entry["id"],
-			"time.step_until exhausted its frame budget (max_frames=%d) after %d frame(s)" % [entry["max_frames"], elapsed])
+			"time.step_until exhausted its frame budget (max_frames=%d) after %d frame(s) — %s" % [
+				entry["max_frames"], elapsed,
+				PlaytestConditions.timeout_tail(entry["selector"], entry["mode"],
+					entry.get("last_value"), entry.get("last_error", {})),
+			])
 		budget_err["frames"] = elapsed
 		return budget_err
 	if entry["deadline_ms"] >= 0 and Time.get_ticks_msec() >= entry["deadline_ms"]:
 		var ceiling_err := PlaytestErrors.timeout(
-			entry["id"], "time.step_until exceeded its 'timeout_ms' safety ceiling after %d frame(s)" % elapsed)
+			entry["id"],
+			"time.step_until exceeded its 'timeout_ms' safety ceiling after %d frame(s) — %s" % [
+				elapsed,
+				PlaytestConditions.timeout_tail(entry["selector"], entry["mode"],
+					entry.get("last_value"), entry.get("last_error", {})),
+			])
 		ceiling_err["frames"] = elapsed
 		return ceiling_err
 	return null

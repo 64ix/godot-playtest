@@ -61,6 +61,16 @@ Scenarios, each launched via `res://addons/playtest/runner.tscn`:
     a prior test's `time_scale()` on instance 0 MUST NOT leak into the next
     test; the runner resets `Engine.time_scale` to 1.0 before every
     `test_*()`.
+17. `wait_for` timeout naming (spec #9, ticket #10):
+    `tests/runner/fixtures/wait_for_timeout/` — a never-true condition MUST
+    time out with the full Condition (`condition: {...}`) and the last
+    observed value (`last value:`) appended after the existing message text
+    (expected to fail, same convention as `broken_selector/`).
+18. `time_step_until` timeout naming (spec #9, ticket #10):
+    `tests/runner/fixtures/step_until_timeout_condition/` — the frame-budget
+    AND safety-ceiling timeouts MUST append the same condition + last-value
+    suffix, with pinned substrings like `after 7 frame(s)` kept intact
+    (expected to fail).
 
 The two-process, real-second-instance scenarios (attach_instance against a
 prepared port-file directory, per-handle verbs/asserts, a dying client as a
@@ -283,13 +293,43 @@ def main() -> None:
     else:
         print("OK time_scale reset (spec #66): exit=0, Engine.time_scale back to 1.0 before the second test")
 
+    code, output = run_suite("res://tests/runner/fixtures/wait_for_timeout/")
+    if code == 0:
+        failures.append(f"wait_for timeout naming: expected exit!=0, got exit=0\n{output}")
+    elif "1 test(s), 1 failure(s)" not in output:
+        failures.append(f"wait_for timeout naming: expected 1 test(s), 1 failure(s)\n{output}")
+    elif "timed out after 300ms" not in output:
+        failures.append(f"wait_for timeout naming: existing prefix not preserved in the message\n{output}")
+    elif 'condition: {"test_id":"score_label","property":"text","equals":"never_this_value"}' not in output:
+        failures.append(f"wait_for timeout naming: full Condition missing from the message\n{output}")
+    elif "last value:" not in output:
+        failures.append(f"wait_for timeout naming: last observed value missing from the message\n{output}")
+    else:
+        print("OK wait_for timeout naming (ticket #10): exit!=0, condition + last value after the preserved prefix")
+
+    code, output = run_suite("res://tests/runner/fixtures/step_until_timeout_condition/")
+    if code == 0:
+        failures.append(f"time_step_until timeout naming: expected exit!=0, got exit=0\n{output}")
+    elif "2 test(s), 2 failure(s)" not in output:
+        failures.append(f"time_step_until timeout naming: expected 2 test(s), 2 failure(s)\n{output}")
+    elif "after 7 frame(s)" not in output:
+        failures.append(f"time_step_until timeout naming: pinned 'after 7 frame(s)' substring lost\n{output}")
+    elif 'condition: {"test_id":"score_label","property":"text","equals":"never_this_value"}' not in output:
+        failures.append(f"time_step_until timeout naming: full Condition missing from the message\n{output}")
+    elif "last value:" not in output:
+        failures.append(f"time_step_until timeout naming: last observed value missing from the message\n{output}")
+    elif "safety ceiling" not in output:
+        failures.append(f"time_step_until timeout naming: safety-ceiling timeout did not fail as expected\n{output}")
+    else:
+        print("OK time_step_until timeout naming (ticket #10): exit!=0, condition + last value on budget and ceiling timeouts")
+
     if failures:
         print("--- FAILURES ---", file=sys.stderr)
         for f in failures:
             print(f, file=sys.stderr)
         sys.exit(1)
 
-    print("PASS 16/16")
+    print("PASS 18/18")
 
 
 if __name__ == "__main__":
