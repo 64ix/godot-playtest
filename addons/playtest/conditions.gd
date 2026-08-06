@@ -37,7 +37,7 @@ static func condition_dict(spec: Dictionary) -> Dictionary:
 ## selector never resolved), so the bare `condition:` tail is unreachable in
 ## practice.
 static func timeout_tail(spec: Dictionary, mode: String, last_value: Variant, last_error: Dictionary) -> String:
-	var tail := "condition: %s" % _condition_json(spec)
+	var tail := "condition: %s" % condition_json(spec)
 	if last_error.has("error"):
 		return tail + "; last error: %s %s" % [last_error["error"], last_error["detail"]]
 	match mode:
@@ -50,13 +50,14 @@ static func timeout_tail(spec: Dictionary, mode: String, last_value: Variant, la
 	return tail
 
 ## `{"test_id":"...","property":"...",...}` — the Condition rendered as a
-## JSON string with the keys in `CONDITION_KEYS` order. Built key by key
-## rather than via `JSON.stringify` of the whole Dictionary: Godot's
-## Dictionary iteration order is hash-table order, not insertion order, so a
-## whole-dict stringify would emit the keys in an engine-internal order that
-## is not stable across versions — while this form is pinned verbatim by the
-## conformance suite.
-static func _condition_json(spec: Dictionary) -> String:
+## JSON string with the keys in `CONDITION_KEYS` order. Public since spec #9
+## ticket #11: the heartbeat lines and the timeout tails both name the
+## Condition through this one canonical string. Built key by key rather than
+## via `JSON.stringify` of the whole Dictionary: Godot's Dictionary iteration
+## order is hash-table order, not insertion order, so a whole-dict stringify
+## would emit the keys in an engine-internal order that is not stable across
+## versions — while this form is pinned verbatim by the conformance suite.
+static func condition_json(spec: Dictionary) -> String:
 	var parts := []
 	for key in CONDITION_KEYS:
 		if spec.has(key):

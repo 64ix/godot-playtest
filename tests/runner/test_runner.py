@@ -74,6 +74,14 @@ Scenarios, each launched via `res://addons/playtest/runner.tscn`:
     AND safety-ceiling timeouts MUST append the same condition + last-value
     suffix, with pinned substrings like `after 7 frame(s)` kept intact
     (expected to fail).
+19. heartbeat (spec #9, ticket #11): `tests/runner/fixtures/heartbeat/`,
+    run with `PLAYTEST_HEARTBEAT_MS=200` — a wait that outlives the
+    interval MUST emit periodic `still waiting for <condition>
+    (<elapsed>/<total>)` lines on stderr, for `wait_for`,
+    `time_step_until` (budget shown as frames), and `assert_eventually_*`
+    (expected to fail, same convention as above); conversely, waits shorter
+    than the interval (the golden path, and `wait_for_timeout/`'s 300ms
+    waits against the default 5s interval) MUST emit nothing.
 
 The two-process, real-second-instance scenarios (attach_instance against a
 prepared port-file directory, per-handle verbs/asserts, a dying client as a
@@ -85,6 +93,7 @@ fit this script's single-runner-call-per-scenario shape.
 Usage: test_runner.py <godot_bin> <project_dir>
 Exit 0 = every scenario behaves as expected.
 """
+import os
 import re
 import shutil
 import subprocess
@@ -95,14 +104,14 @@ from pathlib import Path
 GODOT, PROJECT = sys.argv[1], sys.argv[2]
 
 
-def run_suite(suite_path: str) -> tuple[int, str]:
+def run_suite(suite_path: str, env=None) -> tuple[int, str]:
     proc = subprocess.run(
         [
             GODOT, "--headless", "--path", PROJECT,
             "res://addons/playtest/runner.tscn",
             "--", f"--suite={suite_path}",
         ],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=60, env=env,
     )
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -143,6 +152,8 @@ def main() -> None:
         failures.append(f"golden path: no '0 failure' report in output\n{output}")
     elif not re.search(r"  ok \(\d+\.\d+s\)", output):
         failures.append(f"golden path: test lines carry no elapsed time ('  ok (<float>s)', ticket #13)\n{output}")
+    elif "still waiting" in output:
+        failures.append(f"golden path: heartbeat line emitted although every wait resolved below the interval (green runs must stay quiet, ticket #11)\n{output}")
     else:
         print("OK golden path (res://playtests/): exit=0")
 
@@ -314,6 +325,8 @@ def main() -> None:
         # `score_label.text` stays "0" for the whole fixture run, so the
         # last OBSERVED VALUE is pinned, not just the `last value:` label.
         failures.append(f"wait_for timeout naming: last observed value missing or wrong in the message\n{output}")
+    elif "still waiting" in output:
+        failures.append(f"wait_for timeout naming: a 300ms wait must not emit heartbeat lines against the default 5s interval (ticket #11)\n{output}")
     else:
         print("OK wait_for timeout naming (ticket #10): exit!=0, condition + last value after the preserved prefix")
 
@@ -336,13 +349,41 @@ def main() -> None:
     else:
         print("OK time_step_until timeout naming (ticket #10): exit!=0, condition + last value on budget and ceiling timeouts")
 
+    code, output = run_suite(
+        "res://tests/runner/fixtures/heartbeat/",
+        env={**os.environ, "PLAYTEST_HEARTBEAT_MS": "200"},
+    )
+    wait_for_hb = (r'still waiting for \{"test_id":"score_label","property":"text",'
+                   r'"equals":"never_this_value"\} \(\d+\.\d/0\.9s\)')
+    step_hb = (r'still waiting for \{"test_id":"score_label","property":"text",'
+               r'"equals":"never_this_value"\} \(\d+/100000 frames\)')
+    eventually_property_hb = (r'still waiting for \{"test_id":"score_button","property":"text",'
+                              r'"equals":"never_this_value"\} \(\d+\.\d/0\.9s\)')
+    eventually_eq_hb = r'still waiting for assert_eventually_eq \(\d+\.\d/0\.9s\)'
+    if code == 0:
+        failures.append(f"heartbeat: expected exit!=0, got exit=0\n{output}")
+    elif "4 test(s), 4 failure(s)" not in output:
+        failures.append(f"heartbeat: expected 4 test(s), 4 failure(s)\n{output}")
+    elif len(re.findall(wait_for_hb, output)) < 3:
+        failures.append(f"heartbeat: wait_for must emit periodic 'still waiting' lines naming the Condition with a seconds budget\n{output}")
+    elif len(re.findall(step_hb, output)) < 2:
+        failures.append(f"heartbeat: time_step_until must emit heartbeat lines with the frame budget shown as frames\n{output}")
+    elif len(re.findall(eventually_property_hb, output)) < 3:
+        failures.append(f"heartbeat: assert_eventually_property must emit heartbeat lines naming its Condition\n{output}")
+    elif len(re.findall(eventually_eq_hb, output)) < 3:
+        failures.append(f"heartbeat: Callable-based assert_eventually_* must emit heartbeat lines naming the assertion kind\n{output}")
+    elif "WARNING" in output:
+        failures.append(f"heartbeat: heartbeat lines must use the plain stderr channel — no WARNING prefix/backtrace noise\n{output}")
+    else:
+        print("OK heartbeat (ticket #11): periodic 'still waiting' lines for wait_for, time_step_until (frames), and assert_eventually_*")
+
     if failures:
         print("--- FAILURES ---", file=sys.stderr)
         for f in failures:
             print(f, file=sys.stderr)
         sys.exit(1)
 
-    print("PASS 18/18")
+    print("PASS 19/19")
 
 
 if __name__ == "__main__":

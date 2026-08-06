@@ -307,6 +307,65 @@ func _condition_spec(selector: Dictionary, opts: Dictionary) -> Dictionary:
 		spec[key] = opts[key]
 	return spec
 
+## Cached `PLAYTEST_HEARTBEAT_MS` (default 5000), resolved on the first
+## heartbeat tick — the interval must be tunable per invocation (a fixture
+## test needs it in the hundreds of milliseconds, not seconds), and reading
+## `OS.get_environment` once beats doing it every poll-loop iteration.
+## Negative marks "not resolved yet"; a missing, empty, or negative value
+## falls back to the 5000ms default.
+var _heartbeat_interval_ms := -1
+
+func _heartbeat_interval() -> int:
+	if _heartbeat_interval_ms < 0:
+		# Unset or unparseable values map to 0 via int("")/int("abc"), which
+		# falls through to the 5000ms default — never a per-frame spam.
+		_heartbeat_interval_ms = int(OS.get_environment("PLAYTEST_HEARTBEAT_MS"))
+		if _heartbeat_interval_ms <= 0:
+			_heartbeat_interval_ms = 5000
+	return _heartbeat_interval_ms
+
+## The shared heartbeat tick (spec #9, ticket #11): called once per poll-loop
+## iteration of `wait_for`, `time_step_until`, `assert_eventually_property`,
+## and the `assert_eventually_*` core. Emits one
+## `still waiting for <label> (<elapsed>/<total>)` line on stderr every
+## `_heartbeat_interval()` ms — threshold-based and always on, so a wait
+## shorter than the interval emits nothing and a green run stays quiet.
+## `state` persists the last emission time (`heartbeat_at_ms`) across
+## iterations — the SAME Dictionary the poll loop already uses (never a fresh
+## one, or the threshold would reset every iteration). `label` is what the
+## line names: the canonical Condition string for waits that have a Condition
+## (`PlaytestConditions.condition_json`), the assertion kind otherwise (a
+## Callable-based `assert_eventually_*` has no Condition — the Callable IS
+## the check, ADR-0006). `elapsed_label`/`total_label` are the rendered
+## budget — `(5.2/30s)` seconds, or `(152/300 frames)` for frame-budgeted
+## step waits.
+##
+## Emits via `printerr()`: the plain stderr channel, which arrives live in a
+## piped terminal and adds no `WARNING:` prefix and no backtrace (verified on
+## Godot 4.6.3 — `push_warning` does both and is unusable here). This
+## function is also the seam ADR-0009's suite-budget deadline check
+## (ticket #12) will extend: every poll loop funnels through here, so a
+## check added in this one place covers all four wait families at once.
+func _heartbeat_tick(state: Dictionary, label: String, elapsed_label: String, total_label: String) -> void:
+	if not state.has("heartbeat_at_ms"):
+		# First tick of this wait: anchor the interval, stay silent — the
+		# threshold counts from the wait's start, not per-iteration (a
+		# `get(key, Time.get_ticks_msec())` default would re-anchor every
+		# frame and never fire).
+		state["heartbeat_at_ms"] = Time.get_ticks_msec()
+		return
+	if Time.get_ticks_msec() - int(state["heartbeat_at_ms"]) < _heartbeat_interval():
+		return
+	state["heartbeat_at_ms"] = Time.get_ticks_msec()
+	printerr("still waiting for %s (%s/%s)" % [label, elapsed_label, total_label])
+
+## Renders a millisecond budget as the heartbeat's total: whole seconds as
+## `30s`, fractional as `0.7s` — the `(5.2/30s)` line shape.
+static func _seconds_label(ms: int) -> String:
+	if ms % 1000 == 0:
+		return "%ds" % (ms / 1000)
+	return "%.1fs" % (ms / 1000.0)
+
 ## Asynchronous `wait_for` (§4, §1.3): re-evaluates the condition every frame
 ## (`await get_tree().process_frame`) until resolution or `timeout_ms` —
 ## THE in-process anti-flake building block, never a blocking `await` on a
@@ -317,6 +376,7 @@ func wait_for(selector: Dictionary, opts: Dictionary = {}) -> Node:
 	if _aborted:
 		return null
 	var timeout_ms: int = int(opts.get("timeout_ms", 5000))
+	var started_ms := Time.get_ticks_msec()
 	var deadline_ms := Time.get_ticks_msec() + timeout_ms
 	var mode := "plain"
 	if opts.has("signal"):
@@ -325,6 +385,7 @@ func wait_for(selector: Dictionary, opts: Dictionary = {}) -> Node:
 		mode = "property"
 	elif opts.has("method"):
 		mode = "method"
+	var condition_label := PlaytestConditions.condition_json(_condition_spec(selector, opts))
 	var state := {}
 
 	while true:
@@ -341,6 +402,9 @@ func wait_for(selector: Dictionary, opts: Dictionary = {}) -> Node:
 			])
 			_aborted = true
 			return null
+		_heartbeat_tick(state, condition_label,
+			"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
+			_seconds_label(timeout_ms))
 		await get_tree().process_frame
 	return null
 
@@ -396,6 +460,7 @@ func time_step_until(selector: Dictionary, opts: Dictionary = {}) -> Dictionary:
 	var max_frames: int = int(opts.get("max_frames", PlaytestDispatch.DEFAULT_STEP_UNTIL_MAX_FRAMES))
 	var start_frame: int = Engine.get_process_frames()
 	var deadline_ms := (Time.get_ticks_msec() + int(opts["timeout_ms"])) if opts.has("timeout_ms") else -1
+	var condition_label := PlaytestConditions.condition_json(_condition_spec(selector, opts))
 	var state := {}
 
 	while true:
@@ -421,6 +486,7 @@ func time_step_until(selector: Dictionary, opts: Dictionary = {}) -> Dictionary:
 			])
 			_aborted = true
 			return {"node": null, "frames": elapsed}
+		_heartbeat_tick(state, condition_label, "%d" % elapsed, "%d frames" % max_frames)
 		await get_tree().process_frame
 	return {"node": null, "frames": 0}
 
@@ -578,7 +644,10 @@ func assert_now_property(selector: Dictionary, property: String, expected: Varia
 func assert_eventually_property(selector: Dictionary, property: String, expected: Variant, message: String = "", timeout_ms: int = DEFAULT_ASSERT_TIMEOUT_MS) -> void:
 	if _aborted:
 		return
+	var started_ms := Time.get_ticks_msec()
 	var deadline_ms := Time.get_ticks_msec() + timeout_ms
+	var condition_label := PlaytestConditions.condition_json(_condition_spec(selector, {"property": property, "equals": expected}))
+	var heartbeat_state := {}
 	while true:
 		var res := Selectors.resolve_strict(_resolution_root(), selector)
 		if res.has("error"):
@@ -596,12 +665,18 @@ func assert_eventually_property(selector: Dictionary, property: String, expected
 				_record_failure(_assert_message("assert_eventually_property", message,
 					"expected %s.%s == %s, got %s" % [selector, property, expected, actual]))
 				return
+			_heartbeat_tick(heartbeat_state, condition_label,
+				"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
+				_seconds_label(timeout_ms))
 			await get_tree().process_frame
 			continue
 		if Time.get_ticks_msec() >= deadline_ms:
 			_record_failure(_assert_message("assert_eventually_property", message,
 				"selector %s never resolved (last: [%s] %s)" % [selector, res["error"], res["detail"]]))
 			return
+		_heartbeat_tick(heartbeat_state, condition_label,
+			"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
+			_seconds_label(timeout_ms))
 		await get_tree().process_frame
 
 ## Core shared by `assert_now_eq`/`assert_now_true`/`assert_now_false`/
@@ -636,7 +711,11 @@ func _assert_eventually(actual: Variant, ok: Callable, describe: Callable, own_k
 	if _aborted:
 		return
 	var getter: Callable = actual
+	var started_ms := Time.get_ticks_msec()
 	var deadline_ms := Time.get_ticks_msec() + timeout_ms
+	# No Condition exists for this family — the Callable IS the check
+	# (ADR-0006) — so the heartbeat names the assertion kind (ticket #11).
+	var heartbeat_state := {}
 	while true:
 		var value = getter.call()
 		if ok.call(value):
@@ -644,6 +723,9 @@ func _assert_eventually(actual: Variant, ok: Callable, describe: Callable, own_k
 		if Time.get_ticks_msec() >= deadline_ms:
 			_record_failure(_assert_message(own_kind, message, describe.call(value)))
 			return
+		_heartbeat_tick(heartbeat_state, own_kind,
+			"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
+			_seconds_label(timeout_ms))
 		await get_tree().process_frame
 
 func _assert_message(kind: String, message: String, detail: String) -> String:
