@@ -1,0 +1,45 @@
+name: mcp-server
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-and-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Provision Godot 4.6.3 (standard, linux x86_64)
+        run: bash .github/scripts/provision-godot.sh
+
+      - name: Import pass (first open of the project)
+        run: ./godot-bin --headless --path . --import || true
+
+      - name: Install MCP server (npm ci + build)
+        working-directory: mcp-server
+        run: |
+          npm ci
+          npm run build
+
+      - name: "Unit tests (fake Bridge: tool translation, port-file, retry)"
+        working-directory: mcp-server
+        run: npm test
+
+      - name: Integration test (real witness_game fixture, headless)
+        working-directory: mcp-server
+        env:
+          GODOT_BIN: ${{ github.workspace }}/godot-bin
+        run: npm run test:integration

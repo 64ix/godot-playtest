@@ -1,0 +1,62 @@
+name: playtestcase-runner
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runner-scenarios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Provision Godot 4.6.3 (standard, linux x86_64)
+        run: bash .github/scripts/provision-godot.sh
+
+      - name: Import pass (first open of the project)
+        run: ./godot-bin --headless --path . --import || true
+
+      - name: Headless runner — golden path + broken selector (rich diagnostics)
+        run: python3 tests/runner/test_runner.py ./godot-bin .
+
+      - name: Headless runner — multi-client (two processes, per-instance addressing)
+        run: python3 tests/runner/test_multi_client.py ./godot-bin .
+
+  golden-path-x20:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Provision Godot 4.6.3 (standard, linux x86_64)
+        run: bash .github/scripts/provision-godot.sh
+
+      - name: Import pass (first open of the project)
+        run: ./godot-bin --headless --path . --import || true
+
+      - name: Reference frozen test (res://playtests/) ×20 headless
+        run: |
+          set -e
+          pass=0
+          for i in $(seq 1 20); do
+            ./godot-bin --headless --path . res://addons/playtest/runner.tscn -- --suite=res://playtests/ > run-$i.log 2>&1
+            code=$?
+            if [ $code -ne 0 ]; then
+              echo "run $i: FAIL (exit=$code)"
+              cat run-$i.log
+              exit 1
+            fi
+            echo "run $i: ok"
+            pass=$((pass + 1))
+          done
+          echo "PASS $pass/20"
