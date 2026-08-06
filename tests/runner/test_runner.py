@@ -302,8 +302,10 @@ def main() -> None:
         failures.append(f"wait_for timeout naming: existing prefix not preserved in the message\n{output}")
     elif 'condition: {"test_id":"score_label","property":"text","equals":"never_this_value"}' not in output:
         failures.append(f"wait_for timeout naming: full Condition missing from the message\n{output}")
-    elif "last value:" not in output:
-        failures.append(f"wait_for timeout naming: last observed value missing from the message\n{output}")
+    elif 'last value: "0"' not in output:
+        # `score_label.text` stays "0" for the whole fixture run, so the
+        # last OBSERVED VALUE is pinned, not just the `last value:` label.
+        failures.append(f"wait_for timeout naming: last observed value missing or wrong in the message\n{output}")
     else:
         print("OK wait_for timeout naming (ticket #10): exit!=0, condition + last value after the preserved prefix")
 
@@ -316,8 +318,11 @@ def main() -> None:
         failures.append(f"time_step_until timeout naming: pinned 'after 7 frame(s)' substring lost\n{output}")
     elif 'condition: {"test_id":"score_label","property":"text","equals":"never_this_value"}' not in output:
         failures.append(f"time_step_until timeout naming: full Condition missing from the message\n{output}")
-    elif "last value:" not in output:
-        failures.append(f"time_step_until timeout naming: last observed value missing from the message\n{output}")
+    elif 'last value: "0"' not in output:
+        # Same pin as the wait_for fixture: `score_label.text` stays "0" on
+        # both the budget and the safety-ceiling timeouts, so the last
+        # OBSERVED VALUE is pinned, not just the `last value:` label.
+        failures.append(f"time_step_until timeout naming: last observed value missing or wrong in the message\n{output}")
     elif "safety ceiling" not in output:
         failures.append(f"time_step_until timeout naming: safety-ceiling timeout did not fail as expected\n{output}")
     else:
