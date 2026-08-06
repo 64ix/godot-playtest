@@ -49,14 +49,16 @@ jobs:
           set -e
           pass=0
           for i in $(seq 1 20); do
+            start=$(date +%s)
             ./godot-bin --headless --path . res://addons/playtest/runner.tscn -- --suite=res://playtests/ > run-$i.log 2>&1
             code=$?
+            end=$(date +%s)
             if [ $code -ne 0 ]; then
-              echo "run $i: FAIL (exit=$code)"
+              echo "run $i: FAIL (exit=$code, $((end - start))s)"
               cat run-$i.log
               exit 1
             fi
-            echo "run $i: ok"
+            echo "run $i: ok ($((end - start))s)"
             pass=$((pass + 1))
           done
           echo "PASS $pass/20"
