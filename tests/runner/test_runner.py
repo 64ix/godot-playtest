@@ -4,11 +4,14 @@
 Scenarios, each launched via `res://addons/playtest/runner.tscn`:
 
 1. golden path: `res://playtests/` (the reference frozen test on
-   fixtures/witness_game) MUST pass — exit 0, no failures reported.
+   fixtures/witness_game) MUST pass — exit 0, no failures reported, and
+   every test line carries its wall-clock elapsed time (`ok (<float>s)`,
+   ticket #13).
 2. broken selector: `tests/runner/fixtures/broken_selector/` (test-id
    renamed by mistake) MUST fail with the rich `not_found` + `suggestions`
    diagnostic in the report — never a silent timeout (the "Broken selector
-   test" criterion of ticket #11).
+   test" criterion of ticket #11); its failing test line carries the
+   elapsed time too (`FAIL (<float>s)`).
 3. single-file suite: `--suite` naming one `.gd` file runs only that file's
    `test_*` methods (ticket #40).
 4. unparseable script: a script that fails to parse MUST be reported as a
@@ -72,6 +75,7 @@ fit this script's single-runner-call-per-scenario shape.
 Usage: test_runner.py <godot_bin> <project_dir>
 Exit 0 = every scenario behaves as expected.
 """
+import re
 import shutil
 import subprocess
 import sys
@@ -127,6 +131,8 @@ def main() -> None:
         failures.append(f"golden path: expected exit=0, got exit={code}\n{output}")
     elif "0 failure" not in output:
         failures.append(f"golden path: no '0 failure' report in output\n{output}")
+    elif not re.search(r"  ok \(\d+\.\d+s\)", output):
+        failures.append(f"golden path: test lines carry no elapsed time ('  ok (<float>s)', ticket #13)\n{output}")
     else:
         print("OK golden path (res://playtests/): exit=0")
 
@@ -139,6 +145,8 @@ def main() -> None:
         failures.append(f"broken selector: 'suggestions' missing from output (silent timeout?)\n{output}")
     elif "timeout" in output.lower():
         failures.append(f"broken selector: failed by timeout instead of the rich diagnostic\n{output}")
+    elif not re.search(r"  FAIL \(\d+\.\d+s\)", output):
+        failures.append(f"broken selector: failing test line carries no elapsed time ('  FAIL (<float>s)', ticket #13)\n{output}")
     else:
         print(f"OK broken selector: exit={code}, not_found + suggestions diagnostic present")
 
