@@ -98,6 +98,11 @@ Scenarios, each launched via `res://addons/playtest/runner.tscn`:
     The hung-attached-instance scenario (the runner's per-frame tick,
     ADR-0009) lives in test_multi_client.py, next to this file — it needs
     a prepared (empty) PLAYTEST_ATTACH_PORTS directory.
+22. suite budget × heartbeat coexistence (spec #9, tickets #11 × #12):
+    the `suite_budget/` fixture with `PLAYTEST_HEARTBEAT_MS=200` AND
+    `PLAYTEST_SUITE_TIMEOUT_SECONDS=1` — heartbeat lines are emitted while
+    the budget is armed, and the budget still trips exit 1 with the
+    distinct expiry line.
 
 The two-process, real-second-instance scenarios (attach_instance against a
 prepared port-file directory, per-handle verbs/asserts, a dying client as a
@@ -431,13 +436,34 @@ def main() -> None:
     else:
         print("OK suite budget between tests (ticket #12): fast test completes, budget trips mid-suite naming the second")
 
+    code, output = run_suite(
+        "res://tests/runner/fixtures/suite_budget/",
+        env={**os.environ, "PLAYTEST_SUITE_TIMEOUT_SECONDS": "1", "PLAYTEST_HEARTBEAT_MS": "200"},
+    )
+    # Cross-unit seam (ticket #11 × #12): with a 200ms heartbeat and a 1s
+    # budget the two features must coexist — the wait emits heartbeat lines
+    # while the budget is armed, and the budget still trips at ~1s with the
+    # distinct expiry line (the heartbeat tick's shared check is not
+    # perturbed by the interval being short).
+    heartbeat_re = re.compile(
+        r'still waiting for \{"test_id":"score_label","property":"text",'
+        r'"equals":"never_this_value"\} \([\d.]+/10s\)')
+    if code != 1:
+        failures.append(f"suite budget + heartbeat: expected exit=1 (budget exceeded), got exit={code}\n{output}")
+    elif expiry_line not in output:
+        failures.append(f"suite budget + heartbeat: expiry line missing\n{output}")
+    elif not heartbeat_re.search(output):
+        failures.append(f"suite budget + heartbeat: heartbeat lines must appear while the budget is armed (1s budget outlives a 200ms interval)\n{output}")
+    else:
+        print("OK suite budget + heartbeat coexist: heartbeat lines emitted under a 1s budget, expiry still trips exit 1")
+
     if failures:
         print("--- FAILURES ---", file=sys.stderr)
         for f in failures:
             print(f, file=sys.stderr)
         sys.exit(1)
 
-    print("PASS 21/21")
+    print("PASS 22/22")
 
 
 if __name__ == "__main__":

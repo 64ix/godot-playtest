@@ -396,6 +396,12 @@ static func _expire_suite_budget() -> void:
 ## loop then only needs its one-line `_suite_expired` abort after the call.
 func _heartbeat_tick(state: Dictionary, label: String, elapsed_label: String, total_label: String) -> void:
 	_check_suite_budget()
+	if _suite_expired:
+		# Suite budget exceeded (ADR-0009): the expiry line is the last
+		# line this wait emits — never a heartbeat after it, even when the
+		# deadline lands on a heartbeat-due frame (or the runner's own
+		# `_process` already printed the expiry).
+		return
 	if not state.has("heartbeat_at_ms"):
 		# First tick of this wait: anchor the interval, stay silent — the
 		# threshold counts from the wait's start, not per-iteration (a
