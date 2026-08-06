@@ -68,12 +68,14 @@ func _ready() -> void:
 			add_child(case)
 			case._reset_report()
 			print("→ %s :: %s" % [script_path, method_name])
+			var started_ms := Time.get_ticks_msec()
 			await case.callv(method_name, [])
+			var elapsed_s := (Time.get_ticks_msec() - started_ms) / 1000.0
 			if case.failures.is_empty():
-				print("  ok")
+				print("  ok (%.1fs)" % elapsed_s)
 			else:
 				failed += 1
-				print("  FAIL (%d failure(s))" % case.failures.size())
+				print("  FAIL (%.1fs)" % elapsed_s)
 				for f in case.failures:
 					print("    - %s" % f["message"])
 					if not f["query_dump"].is_empty():
