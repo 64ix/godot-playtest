@@ -82,6 +82,22 @@ Scenarios, each launched via `res://addons/playtest/runner.tscn`:
     (expected to fail, same convention as above); conversely, waits shorter
     than the interval (the golden path, and `wait_for_timeout/`'s 300ms
     waits against the default 5s interval) MUST emit nothing.
+20. suite budget, mid-wait (spec #9, ticket #12):
+    `tests/runner/fixtures/suite_budget/`, run with
+    `PLAYTEST_SUITE_TIMEOUT_SECONDS=1` — a 10s never-true `wait_for` MUST
+    be cut off by the budget: exit 1 with the distinct
+    `[playtest-runner] suite budget exceeded (1s) while running
+    <file> :: <method>` line naming the offending test, no FAIL for it and
+    no summary report (the expiry line is distinguishable from an ordinary
+    test failure by any parser).
+21. suite budget, mid-suite (spec #9, ticket #12):
+    `tests/runner/fixtures/suite_budget_between/`, run with
+    `PLAYTEST_SUITE_TIMEOUT_SECONDS=1` — the budget is a SUITE-level
+    deadline: a fast first test completes (`ok (<float>s)` printed), then
+    the budget trips during the slow second test, exit 1 naming it.
+    The hung-attached-instance scenario (the runner's per-frame tick,
+    ADR-0009) lives in test_multi_client.py, next to this file — it needs
+    a prepared (empty) PLAYTEST_ATTACH_PORTS directory.
 
 The two-process, real-second-instance scenarios (attach_instance against a
 prepared port-file directory, per-handle verbs/asserts, a dying client as a
@@ -154,6 +170,8 @@ def main() -> None:
         failures.append(f"golden path: test lines carry no elapsed time ('  ok (<float>s)', ticket #13)\n{output}")
     elif "still waiting" in output:
         failures.append(f"golden path: heartbeat line emitted although every wait resolved below the interval (green runs must stay quiet, ticket #11)\n{output}")
+    elif "suite budget exceeded" in output:
+        failures.append(f"golden path: suite-budget expiry line emitted without PLAYTEST_SUITE_TIMEOUT_SECONDS (budget must be off by default, ticket #12)\n{output}")
     else:
         print("OK golden path (res://playtests/): exit=0")
 
@@ -377,13 +395,49 @@ def main() -> None:
     else:
         print("OK heartbeat (ticket #11): periodic 'still waiting' lines for wait_for, time_step_until (frames), and assert_eventually_*")
 
+    code, output = run_suite(
+        "res://tests/runner/fixtures/suite_budget/",
+        env={**os.environ, "PLAYTEST_SUITE_TIMEOUT_SECONDS": "1"},
+    )
+    expiry_line = ("suite budget exceeded (1s) while running "
+                   "res://tests/runner/fixtures/suite_budget/suite_budget_test.gd :: "
+                   "test_slow_wait_exceeds_budget")
+    if code != 1:
+        failures.append(f"suite budget: expected exit=1 (budget exceeded), got exit={code}\n{output}")
+    elif expiry_line not in output:
+        failures.append(f"suite budget: expiry line missing — must name the offending file :: method\n{output}")
+    elif "FAIL" in output:
+        failures.append(f"suite budget: the cut-off wait must not print a FAIL (the expiry line is distinct from an ordinary failure)\n{output}")
+    elif "failure(s)" in output:
+        failures.append(f"suite budget: no summary report may follow the expiry (the suite never completed)\n{output}")
+    else:
+        print("OK suite budget (ticket #12): exit=1, expiry line names the offending test, distinct from a FAIL")
+
+    code, output = run_suite(
+        "res://tests/runner/fixtures/suite_budget_between/",
+        env={**os.environ, "PLAYTEST_SUITE_TIMEOUT_SECONDS": "1"},
+    )
+    between_expiry = ("suite budget exceeded (1s) while running "
+                      "res://tests/runner/fixtures/suite_budget_between/suite_budget_between_test.gd :: "
+                      "test_two_slow_wait_exceeds_budget")
+    if code != 1:
+        failures.append(f"suite budget between tests: expected exit=1 (budget exceeded), got exit={code}\n{output}")
+    elif "  ok (" not in output:
+        failures.append(f"suite budget between tests: the fast first test must have completed ('  ok (' line) before the budget trips\n{output}")
+    elif between_expiry not in output:
+        failures.append(f"suite budget between tests: expiry line missing — must name the slow second test\n{output}")
+    elif "FAIL" in output:
+        failures.append(f"suite budget between tests: the cut-off second test must not print a FAIL\n{output}")
+    else:
+        print("OK suite budget between tests (ticket #12): fast test completes, budget trips mid-suite naming the second")
+
     if failures:
         print("--- FAILURES ---", file=sys.stderr)
         for f in failures:
             print(f, file=sys.stderr)
         sys.exit(1)
 
-    print("PASS 19/19")
+    print("PASS 21/21")
 
 
 if __name__ == "__main__":
