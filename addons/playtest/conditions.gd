@@ -8,11 +8,12 @@ class_name PlaytestConditions
 extends RefCounted
 
 ## The keys that make up a Condition, in a stable order for JSON output: the
-## Selector keys first, then the mode and comparison keys — never the wait
-## bookkeeping (cmd/id/timeout_ms/max_frames), which callers may well have
-## merged into the same Dictionary (the network projection passes the whole
-## request).
-const CONDITION_KEYS := ["test_id", "group", "path", "property", "equals", "signal", "method", "args"]
+## Selector keys first, then the mode and comparison keys in their natural
+## reading order (`property`, `equals` — or `signal`, or `method`, `args`,
+## `equals`) — never the wait bookkeeping (cmd/id/timeout_ms/max_frames),
+## which callers may well have merged into the same Dictionary (the network
+## projection passes the whole request).
+const CONDITION_KEYS := ["test_id", "group", "path", "property", "signal", "method", "args", "equals"]
 
 ## The Condition as a JSON-safe Dictionary: `spec`'s selector + mode keys,
 ## values through the Variant→JSON mapping (the same representation the wire
@@ -36,7 +37,7 @@ static func condition_dict(spec: Dictionary) -> Dictionary:
 ## selector never resolved), so the bare `condition:` tail is unreachable in
 ## practice.
 static func timeout_tail(spec: Dictionary, mode: String, last_value: Variant, last_error: Dictionary) -> String:
-	var tail := "condition: %s" % JSON.stringify(condition_dict(spec))
+	var tail := "condition: %s" % _condition_json(spec)
 	if last_error.has("error"):
 		return tail + "; last error: %s %s" % [last_error["error"], last_error["detail"]]
 	match mode:
@@ -47,3 +48,17 @@ static func timeout_tail(spec: Dictionary, mode: String, last_value: Variant, la
 		"signal":
 			return tail + "; signal never fired"
 	return tail
+
+## `{"test_id":"...","property":"...",...}` — the Condition rendered as a
+## JSON string with the keys in `CONDITION_KEYS` order. Built key by key
+## rather than via `JSON.stringify` of the whole Dictionary: Godot's
+## Dictionary iteration order is hash-table order, not insertion order, so a
+## whole-dict stringify would emit the keys in an engine-internal order that
+## is not stable across versions — while this form is pinned verbatim by the
+## conformance suite.
+static func _condition_json(spec: Dictionary) -> String:
+	var parts := []
+	for key in CONDITION_KEYS:
+		if spec.has(key):
+			parts.append('"%s":%s' % [key, JSON.stringify(PlaytestVariantJson.to_json(spec[key]))])
+	return "{%s}" % ",".join(parts)

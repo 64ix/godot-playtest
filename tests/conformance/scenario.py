@@ -442,7 +442,10 @@ def check_wait_for_method_timeout(b):
                args=[9999], equals=True, timeout_ms=300)
     assert not r["ok"], r
     assert r["error"] == "timeout", r
-    assert 'condition: {"test_id":"game","method":"score_at_least","args":[9999],"equals":true}' in r["detail"], r
+    # `9999.0`: JSON numbers always arrive as float on the Godot side (a
+    # documented JSON.parse_string limitation) — the condition renders what
+    # the Bridge is actually waiting on.
+    assert 'condition: {"test_id":"game","method":"score_at_least","args":[9999.0],"equals":true}' in r["detail"], r
     assert "last return value: false" in r["detail"], r
 
 
