@@ -148,10 +148,11 @@ variable:
 
 The harness's launch is a **hard requirement**, not a suggestion: one
 supervised process group, a wall-clock timeout, signal escalation if a
-child refuses to exit — the addon's own contribution is limited to a
-best-effort `quit` sent to whatever it connected to, once, at the very end
-of the whole suite invocation; it never signals a process it didn't launch,
-and it never retries a launch that never happened.
+child refuses to exit — the addon's own contribution is limited to its own
+suite budget (`PLAYTEST_SUITE_TIMEOUT_SECONDS`, ADR-0009) and a best-effort
+`quit` sent to whatever it connected to, once, at the very end of the whole
+suite invocation; it never signals a process it didn't launch, and it never
+retries a launch that never happened.
 
 Two gotchas worth stating up front, both consequences of the topology
 rather than of any single game:

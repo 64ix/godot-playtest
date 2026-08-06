@@ -31,6 +31,18 @@ its Trace.
 **Frozen test**
 A deterministic GDScript test that runs without an agent, MCP server, editor,
 or Bridge, locally or in CI.
+_Avoid_: frozen scenario
+
+**Condition**
+The full wait specification passed to `wait_for` / `time_step_until`: the
+Selector plus the mode and comparison (`property`/`equals`, `signal`,
+`method`/`args`/`equals`). Timeout messages and heartbeat lines name the
+Condition, never just the Selector.
+
+**Selector**
+The node-locating part of a Condition (`test_id`, …), and the parameter the
+read/action verbs address nodes by.
+_Avoid_: locator, node path
 
 **Demo game**
 An open-source game used to exercise the tool end to end. The current demo is
