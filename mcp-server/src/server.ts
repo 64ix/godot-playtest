@@ -7,13 +7,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools } from "./tools.js";
 import { Session } from "./session.js";
+import { createProgressReporter } from "./progress.js";
 
 export function createServer(): { server: McpServer; session: Session } {
   const server = new McpServer({
     name: "godot-playtest-mcp",
     version: "0.1.0",
   });
-  const session = new Session();
+  const session = new Session(createProgressReporter(server));
   registerTools(server, session);
   return { server, session };
 }

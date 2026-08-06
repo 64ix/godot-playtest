@@ -12,6 +12,12 @@ import { BridgeClient } from "./bridge-client.js";
 import { launchGame, LaunchGameOptions, LaunchedGame, StopGameOptions, stopGame } from "./launch.js";
 import { assertValidNewInstanceName, DEFAULT_INSTANCE } from "./instance-name.js";
 import { AssertionTraceEntry, Selector, TraceEntry, isReplayableVerb } from "./trace.js";
+import { ProgressReporter } from "./progress.js";
+
+/** Wait verbs whose Bridge-side wait can span the progress cadence (spec #9,
+ * ticket #14): `time.frames` is excluded — it is a deterministic sync point
+ * with no condition and no deadline (DRAFT-v0.md §4). */
+const WAIT_VERBS = new Set(["wait_for", "time.step_until"]);
 
 export class NotConnectedError extends Error {
   readonly instance: string;
@@ -44,6 +50,12 @@ function annotateInstance(response: Record<string, unknown>, instance: string): 
 
 export class Session {
   private connections = new Map<string, ConnectionSlot>();
+
+  /** Progress reporter (spec #9, ticket #14): threaded into `BridgeClient.send`
+   * for wait verbs, so a slow `wait_for`/`time.step_until` emits `$/progress`
+   * notifications and server console lines naming the condition and
+   * elapsed/total. Defaults to a no-op (unit tests of the session alone). */
+  constructor(private readonly progress: ProgressReporter = () => {}) {}
 
   /** Session trace (ticket #13): replayable verbs + assertions the agent has
    * set, in order — raw material for `freeze_scenario`. One trace for the
@@ -180,14 +192,21 @@ export class Session {
    * `clientTimeoutMs` overrides the default client-side timeout (dogfooding
    * friction: in windowed mode, shader compilation freezes the game's main
    * thread beyond the default 10s). Purely client-side: never sent to the
-   * Bridge, never recorded in the trace. */
+   * Bridge, never recorded in the trace. Wait verbs additionally carry the
+   * session's progress reporter (ticket #14), so an in-flight wait ticks
+   * `$/progress` at the heartbeat cadence. */
   async call(
     cmd: string,
     params: Record<string, unknown> = {},
     clientTimeoutMs?: number,
     instance: string = DEFAULT_INSTANCE,
   ): Promise<Record<string, unknown>> {
-    const response = await this.requireClient(instance).send(cmd, params, clientTimeoutMs);
+    const response = await this.requireClient(instance).send(
+      cmd,
+      params,
+      clientTimeoutMs,
+      WAIT_VERBS.has(cmd) ? this.progress : undefined,
+    );
     if (isReplayableVerb(cmd) && response["ok"] === true) {
       this.trace.push({ kind: "verb", cmd, params, response, at: this.trace.length, instance });
     }
@@ -221,6 +240,7 @@ export class Session {
         timeout_ms: timeoutMs,
       },
       clientTimeoutMs,
+      this.progress,
     );
     if (resp["ok"] === true) {
       const entry: AssertionTraceEntry = {
