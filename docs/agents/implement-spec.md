@@ -118,5 +118,9 @@ Skills that publish or consume specs in this repo follow them:
   sub-issues aren't available, a `## Parent` section naming the spec is the
   fallback. Dependencies between tickets use native **blocked-by**
   relationships, with a `## Blocked by` section as the fallback.
+- When a spec is written to resolve an existing issue, it names that issue in
+  its body as **`Originates from #N`** (the issue whose problem the spec turns
+  into a design). The runner detects it, mentions it in the PR body as the
+  `Source issue`, and closes it with the PR once the spec is fully resolved.
 - `/implement-spec` implements exactly one spec: directly when autosufficient,
   through its child tickets otherwise. It never merges the PR it opens.
