@@ -4,11 +4,14 @@
 Scenarios, each launched via `res://addons/playtest/runner.tscn`:
 
 1. golden path: `res://playtests/` (the reference frozen test on
-   fixtures/witness_game) MUST pass — exit 0, no failures reported.
+   fixtures/witness_game) MUST pass — exit 0, no failures reported, and
+   every test line carries its wall-clock elapsed time (`ok (<float>s)`,
+   ticket #13).
 2. broken selector: `tests/runner/fixtures/broken_selector/` (test-id
    renamed by mistake) MUST fail with the rich `not_found` + `suggestions`
    diagnostic in the report — never a silent timeout (the "Broken selector
-   test" criterion of ticket #11).
+   test" criterion of ticket #11); its failing test line carries the
+   elapsed time too (`FAIL (<float>s)`).
 3. single-file suite: `--suite` naming one `.gd` file runs only that file's
    `test_*` methods (ticket #40).
 4. unparseable script: a script that fails to parse MUST be reported as a
@@ -61,6 +64,45 @@ Scenarios, each launched via `res://addons/playtest/runner.tscn`:
     a prior test's `time_scale()` on instance 0 MUST NOT leak into the next
     test; the runner resets `Engine.time_scale` to 1.0 before every
     `test_*()`.
+17. `wait_for` timeout naming (spec #9, ticket #10):
+    `tests/runner/fixtures/wait_for_timeout/` — a never-true condition MUST
+    time out with the full Condition (`condition: {...}`) and the last
+    observed value (`last value:`) appended after the existing message text
+    (expected to fail, same convention as `broken_selector/`).
+18. `time_step_until` timeout naming (spec #9, ticket #10):
+    `tests/runner/fixtures/step_until_timeout_condition/` — the frame-budget
+    AND safety-ceiling timeouts MUST append the same condition + last-value
+    suffix, with pinned substrings like `after 7 frame(s)` kept intact
+    (expected to fail).
+19. heartbeat (spec #9, ticket #11): `tests/runner/fixtures/heartbeat/`,
+    run with `PLAYTEST_HEARTBEAT_MS=200` — a wait that outlives the
+    interval MUST emit periodic `still waiting for <condition>
+    (<elapsed>/<total>)` lines on stderr, for `wait_for`,
+    `time_step_until` (budget shown as frames), and `assert_eventually_*`
+    (expected to fail, same convention as above); conversely, waits shorter
+    than the interval (the golden path, and `wait_for_timeout/`'s 300ms
+    waits against the default 5s interval) MUST emit nothing.
+20. suite budget, mid-wait (spec #9, ticket #12):
+    `tests/runner/fixtures/suite_budget/`, run with
+    `PLAYTEST_SUITE_TIMEOUT_SECONDS=1` — a 10s never-true `wait_for` MUST
+    be cut off by the budget: exit 1 with the distinct
+    `[playtest-runner] suite budget exceeded (1s) while running
+    <file> :: <method>` line naming the offending test, no FAIL for it and
+    no summary report (the expiry line is distinguishable from an ordinary
+    test failure by any parser).
+21. suite budget, mid-suite (spec #9, ticket #12):
+    `tests/runner/fixtures/suite_budget_between/`, run with
+    `PLAYTEST_SUITE_TIMEOUT_SECONDS=1` — the budget is a SUITE-level
+    deadline: a fast first test completes (`ok (<float>s)` printed), then
+    the budget trips during the slow second test, exit 1 naming it.
+    The hung-attached-instance scenario (the runner's per-frame tick,
+    ADR-0009) lives in test_multi_client.py, next to this file — it needs
+    a prepared (empty) PLAYTEST_ATTACH_PORTS directory.
+22. suite budget × heartbeat coexistence (spec #9, tickets #11 × #12):
+    the `suite_budget/` fixture with `PLAYTEST_HEARTBEAT_MS=200` AND
+    `PLAYTEST_SUITE_TIMEOUT_SECONDS=1` — heartbeat lines are emitted while
+    the budget is armed, and the budget still trips exit 1 with the
+    distinct expiry line.
 
 The two-process, real-second-instance scenarios (attach_instance against a
 prepared port-file directory, per-handle verbs/asserts, a dying client as a
@@ -72,6 +114,8 @@ fit this script's single-runner-call-per-scenario shape.
 Usage: test_runner.py <godot_bin> <project_dir>
 Exit 0 = every scenario behaves as expected.
 """
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -81,14 +125,14 @@ from pathlib import Path
 GODOT, PROJECT = sys.argv[1], sys.argv[2]
 
 
-def run_suite(suite_path: str) -> tuple[int, str]:
+def run_suite(suite_path: str, env=None) -> tuple[int, str]:
     proc = subprocess.run(
         [
             GODOT, "--headless", "--path", PROJECT,
             "res://addons/playtest/runner.tscn",
             "--", f"--suite={suite_path}",
         ],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=60, env=env,
     )
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -127,6 +171,12 @@ def main() -> None:
         failures.append(f"golden path: expected exit=0, got exit={code}\n{output}")
     elif "0 failure" not in output:
         failures.append(f"golden path: no '0 failure' report in output\n{output}")
+    elif not re.search(r"  ok \(\d+\.\d+s\)", output):
+        failures.append(f"golden path: test lines carry no elapsed time ('  ok (<float>s)', ticket #13)\n{output}")
+    elif "still waiting" in output:
+        failures.append(f"golden path: heartbeat line emitted although every wait resolved below the interval (green runs must stay quiet, ticket #11)\n{output}")
+    elif "suite budget exceeded" in output:
+        failures.append(f"golden path: suite-budget expiry line emitted without PLAYTEST_SUITE_TIMEOUT_SECONDS (budget must be off by default, ticket #12)\n{output}")
     else:
         print("OK golden path (res://playtests/): exit=0")
 
@@ -139,6 +189,8 @@ def main() -> None:
         failures.append(f"broken selector: 'suggestions' missing from output (silent timeout?)\n{output}")
     elif "timeout" in output.lower():
         failures.append(f"broken selector: failed by timeout instead of the rich diagnostic\n{output}")
+    elif not re.search(r"  FAIL \(\d+\.\d+s\)", output):
+        failures.append(f"broken selector: failing test line carries no elapsed time ('  FAIL (<float>s)', ticket #13)\n{output}")
     else:
         print(f"OK broken selector: exit={code}, not_found + suggestions diagnostic present")
 
@@ -283,13 +335,135 @@ def main() -> None:
     else:
         print("OK time_scale reset (spec #66): exit=0, Engine.time_scale back to 1.0 before the second test")
 
+    code, output = run_suite("res://tests/runner/fixtures/wait_for_timeout/")
+    if code == 0:
+        failures.append(f"wait_for timeout naming: expected exit!=0, got exit=0\n{output}")
+    elif "1 test(s), 1 failure(s)" not in output:
+        failures.append(f"wait_for timeout naming: expected 1 test(s), 1 failure(s)\n{output}")
+    elif "timed out after 300ms" not in output:
+        failures.append(f"wait_for timeout naming: existing prefix not preserved in the message\n{output}")
+    elif 'condition: {"test_id":"score_label","property":"text","equals":"never_this_value"}' not in output:
+        failures.append(f"wait_for timeout naming: full Condition missing from the message\n{output}")
+    elif 'last value: "0"' not in output:
+        # `score_label.text` stays "0" for the whole fixture run, so the
+        # last OBSERVED VALUE is pinned, not just the `last value:` label.
+        failures.append(f"wait_for timeout naming: last observed value missing or wrong in the message\n{output}")
+    elif "still waiting" in output:
+        failures.append(f"wait_for timeout naming: a 300ms wait must not emit heartbeat lines against the default 5s interval (ticket #11)\n{output}")
+    else:
+        print("OK wait_for timeout naming (ticket #10): exit!=0, condition + last value after the preserved prefix")
+
+    code, output = run_suite("res://tests/runner/fixtures/step_until_timeout_condition/")
+    if code == 0:
+        failures.append(f"time_step_until timeout naming: expected exit!=0, got exit=0\n{output}")
+    elif "2 test(s), 2 failure(s)" not in output:
+        failures.append(f"time_step_until timeout naming: expected 2 test(s), 2 failure(s)\n{output}")
+    elif "after 7 frame(s)" not in output:
+        failures.append(f"time_step_until timeout naming: pinned 'after 7 frame(s)' substring lost\n{output}")
+    elif 'condition: {"test_id":"score_label","property":"text","equals":"never_this_value"}' not in output:
+        failures.append(f"time_step_until timeout naming: full Condition missing from the message\n{output}")
+    elif 'last value: "0"' not in output:
+        # Same pin as the wait_for fixture: `score_label.text` stays "0" on
+        # both the budget and the safety-ceiling timeouts, so the last
+        # OBSERVED VALUE is pinned, not just the `last value:` label.
+        failures.append(f"time_step_until timeout naming: last observed value missing or wrong in the message\n{output}")
+    elif "safety ceiling" not in output:
+        failures.append(f"time_step_until timeout naming: safety-ceiling timeout did not fail as expected\n{output}")
+    else:
+        print("OK time_step_until timeout naming (ticket #10): exit!=0, condition + last value on budget and ceiling timeouts")
+
+    code, output = run_suite(
+        "res://tests/runner/fixtures/heartbeat/",
+        env={**os.environ, "PLAYTEST_HEARTBEAT_MS": "200"},
+    )
+    wait_for_hb = (r'still waiting for \{"test_id":"score_label","property":"text",'
+                   r'"equals":"never_this_value"\} \(\d+\.\d/0\.9s\)')
+    step_hb = (r'still waiting for \{"test_id":"score_label","property":"text",'
+               r'"equals":"never_this_value"\} \(\d+/100000 frames\)')
+    eventually_property_hb = (r'still waiting for \{"test_id":"score_button","property":"text",'
+                              r'"equals":"never_this_value"\} \(\d+\.\d/0\.9s\)')
+    eventually_eq_hb = r'still waiting for assert_eventually_eq \(\d+\.\d/0\.9s\)'
+    if code == 0:
+        failures.append(f"heartbeat: expected exit!=0, got exit=0\n{output}")
+    elif "4 test(s), 4 failure(s)" not in output:
+        failures.append(f"heartbeat: expected 4 test(s), 4 failure(s)\n{output}")
+    elif len(re.findall(wait_for_hb, output)) < 3:
+        failures.append(f"heartbeat: wait_for must emit periodic 'still waiting' lines naming the Condition with a seconds budget\n{output}")
+    elif len(re.findall(step_hb, output)) < 2:
+        failures.append(f"heartbeat: time_step_until must emit heartbeat lines with the frame budget shown as frames\n{output}")
+    elif len(re.findall(eventually_property_hb, output)) < 3:
+        failures.append(f"heartbeat: assert_eventually_property must emit heartbeat lines naming its Condition\n{output}")
+    elif len(re.findall(eventually_eq_hb, output)) < 3:
+        failures.append(f"heartbeat: Callable-based assert_eventually_* must emit heartbeat lines naming the assertion kind\n{output}")
+    elif "WARNING" in output:
+        failures.append(f"heartbeat: heartbeat lines must use the plain stderr channel — no WARNING prefix/backtrace noise\n{output}")
+    else:
+        print("OK heartbeat (ticket #11): periodic 'still waiting' lines for wait_for, time_step_until (frames), and assert_eventually_*")
+
+    code, output = run_suite(
+        "res://tests/runner/fixtures/suite_budget/",
+        env={**os.environ, "PLAYTEST_SUITE_TIMEOUT_SECONDS": "1"},
+    )
+    expiry_line = ("suite budget exceeded (1s) while running "
+                   "res://tests/runner/fixtures/suite_budget/suite_budget_test.gd :: "
+                   "test_slow_wait_exceeds_budget")
+    if code != 1:
+        failures.append(f"suite budget: expected exit=1 (budget exceeded), got exit={code}\n{output}")
+    elif expiry_line not in output:
+        failures.append(f"suite budget: expiry line missing — must name the offending file :: method\n{output}")
+    elif "FAIL" in output:
+        failures.append(f"suite budget: the cut-off wait must not print a FAIL (the expiry line is distinct from an ordinary failure)\n{output}")
+    elif "failure(s)" in output:
+        failures.append(f"suite budget: no summary report may follow the expiry (the suite never completed)\n{output}")
+    else:
+        print("OK suite budget (ticket #12): exit=1, expiry line names the offending test, distinct from a FAIL")
+
+    code, output = run_suite(
+        "res://tests/runner/fixtures/suite_budget_between/",
+        env={**os.environ, "PLAYTEST_SUITE_TIMEOUT_SECONDS": "1"},
+    )
+    between_expiry = ("suite budget exceeded (1s) while running "
+                      "res://tests/runner/fixtures/suite_budget_between/suite_budget_between_test.gd :: "
+                      "test_two_slow_wait_exceeds_budget")
+    if code != 1:
+        failures.append(f"suite budget between tests: expected exit=1 (budget exceeded), got exit={code}\n{output}")
+    elif "  ok (" not in output:
+        failures.append(f"suite budget between tests: the fast first test must have completed ('  ok (' line) before the budget trips\n{output}")
+    elif between_expiry not in output:
+        failures.append(f"suite budget between tests: expiry line missing — must name the slow second test\n{output}")
+    elif "FAIL" in output:
+        failures.append(f"suite budget between tests: the cut-off second test must not print a FAIL\n{output}")
+    else:
+        print("OK suite budget between tests (ticket #12): fast test completes, budget trips mid-suite naming the second")
+
+    code, output = run_suite(
+        "res://tests/runner/fixtures/suite_budget/",
+        env={**os.environ, "PLAYTEST_SUITE_TIMEOUT_SECONDS": "1", "PLAYTEST_HEARTBEAT_MS": "200"},
+    )
+    # Cross-unit seam (ticket #11 × #12): with a 200ms heartbeat and a 1s
+    # budget the two features must coexist — the wait emits heartbeat lines
+    # while the budget is armed, and the budget still trips at ~1s with the
+    # distinct expiry line (the heartbeat tick's shared check is not
+    # perturbed by the interval being short).
+    heartbeat_re = re.compile(
+        r'still waiting for \{"test_id":"score_label","property":"text",'
+        r'"equals":"never_this_value"\} \([\d.]+/10s\)')
+    if code != 1:
+        failures.append(f"suite budget + heartbeat: expected exit=1 (budget exceeded), got exit={code}\n{output}")
+    elif expiry_line not in output:
+        failures.append(f"suite budget + heartbeat: expiry line missing\n{output}")
+    elif not heartbeat_re.search(output):
+        failures.append(f"suite budget + heartbeat: heartbeat lines must appear while the budget is armed (1s budget outlives a 200ms interval)\n{output}")
+    else:
+        print("OK suite budget + heartbeat coexist: heartbeat lines emitted under a 1s budget, expiry still trips exit 1")
+
     if failures:
         print("--- FAILURES ---", file=sys.stderr)
         for f in failures:
             print(f, file=sys.stderr)
         sys.exit(1)
 
-    print("PASS 16/16")
+    print("PASS 22/22")
 
 
 if __name__ == "__main__":

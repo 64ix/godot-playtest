@@ -16,6 +16,12 @@ const WAIT_FOR_TIMEOUT_MARGIN_MS = 2_000;
 /** Conservative floor used to derive a client-side ceiling from `max_frames`
  * alone (no wall-clock estimate is otherwise possible from a frame count). */
 const ASSUMED_MIN_FPS = 10;
+/** Default cadence of the per-request progress ticks (spec #9, ticket #14):
+ * same 5s as the in-process frozen-test heartbeat. */
+const DEFAULT_PROGRESS_INTERVAL_MS = 5_000;
+/** Env override for the progress cadence: unit tests shorten it so a slow
+ * fake-Bridge wait doesn't sleep 5s. */
+const PROGRESS_INTERVAL_ENV = "GODOT_PLAYTEST_PROGRESS_INTERVAL_MS";
 
 export class BridgeTimeoutError extends Error {
   constructor(cmd: string, timeoutMs: number) {
@@ -35,7 +41,21 @@ interface Waiter {
   resolve: (resp: Record<string, unknown>) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
+  interval?: NodeJS.Timeout;
   cmd: string;
+}
+
+/** One tick of the per-request progress reporter (spec #9, ticket #14),
+ * emitted at the heartbeat cadence while a wait verb is in flight. */
+export interface WaitProgress {
+  /** Wire request id this report belongs to (stable across ticks). */
+  id: number;
+  /** Human-readable description of the condition being waited on. */
+  message: string;
+  /** Milliseconds elapsed since the request was sent. */
+  elapsedMs: number;
+  /** Client-side deadline for the request, in ms. */
+  totalMs: number;
 }
 
 export interface ConnectOptions {
@@ -130,6 +150,7 @@ export class BridgeClient {
     if (!waiter) return; // response to a request already abandoned (client-side timeout)
     this.waiters.delete(id);
     clearTimeout(waiter.timer);
+    if (waiter.interval) clearInterval(waiter.interval);
     waiter.resolve(resp);
   }
 
@@ -137,6 +158,7 @@ export class BridgeClient {
     this.closed = true;
     for (const [id, waiter] of this.waiters) {
       clearTimeout(waiter.timer);
+      if (waiter.interval) clearInterval(waiter.interval);
       waiter.reject(new BridgeConnectionError(`bridge connection closed before '${waiter.cmd}' (id=${id}) responded`));
     }
     this.waiters.clear();
@@ -148,8 +170,21 @@ export class BridgeClient {
 
   /** Sends a verb and waits for its response, correlated by `id`. The id
    * counter is monotonic for the whole lifetime of the connection (§1:
-   * correlation is mandatory, including for out-of-order responses). */
-  async send(cmd: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<Record<string, unknown>> {
+   * correlation is mandatory, including for out-of-order responses).
+   *
+   * `progress` (spec #9, ticket #14): while the request is in flight, a
+   * reporter is ticked at the heartbeat cadence (5s default,
+   * `GODOT_PLAYTEST_PROGRESS_INTERVAL_MS` to override) with the condition
+   * being waited on and elapsed/total — so a slow wait is distinguishable
+   * from a dead one. Only wait verbs pass a reporter (see session.ts);
+   * normal-speed waits resolve before the first tick and stay silent. The
+   * interval is cleared on every exit path (response, timeout, close). */
+  async send(
+    cmd: string,
+    params: Record<string, unknown> = {},
+    timeoutMs?: number,
+    progress?: (report: WaitProgress) => void,
+  ): Promise<Record<string, unknown>> {
     if (this.closed) {
       throw new BridgeConnectionError("bridge connection is closed");
     }
@@ -157,15 +192,29 @@ export class BridgeClient {
     const effectiveTimeout = timeoutMs ?? BridgeClient.timeoutFor(cmd, params);
     const req = { id, cmd, ...params };
     return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      let interval: NodeJS.Timeout | undefined;
+      if (progress !== undefined) {
+        interval = setInterval(() => {
+          progress({
+            id,
+            message: describeWaitCondition(cmd, params),
+            elapsedMs: Date.now() - startedAt,
+            totalMs: effectiveTimeout,
+          });
+        }, progressIntervalMs());
+      }
       const timer = setTimeout(() => {
         this.waiters.delete(id);
+        if (interval) clearInterval(interval);
         reject(new BridgeTimeoutError(cmd, effectiveTimeout));
       }, effectiveTimeout);
-      this.waiters.set(id, { resolve, reject, timer, cmd });
+      this.waiters.set(id, { resolve, reject, timer, interval, cmd });
       this.socket.write(JSON.stringify(req) + "\n", (err) => {
         if (err) {
           this.waiters.delete(id);
           clearTimeout(timer);
+          if (interval) clearInterval(interval);
           reject(new BridgeConnectionError(`write failed: ${err.message}`));
         }
       });
@@ -197,6 +246,34 @@ export class BridgeClient {
     this.closed = true;
     this.socket.destroy();
   }
+}
+
+/** Progress cadence in ms: `GODOT_PLAYTEST_PROGRESS_INTERVAL_MS` overrides
+ * the 5s default (tests shorten it; the in-process frozen-test heartbeat
+ * runs at the same default cadence, spec #9). Read per request, so a test
+ * can set it right before the call it wants to shorten. */
+function progressIntervalMs(): number {
+  const env = process.env[PROGRESS_INTERVAL_ENV];
+  if (env === undefined) return DEFAULT_PROGRESS_INTERVAL_MS;
+  const parsed = Number(env);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_PROGRESS_INTERVAL_MS;
+}
+
+/** Human-readable description of the condition a wait verb is waiting on
+ * (spec #9: progress lines must "name the condition", not just the verb):
+ * the resolved selector plus the mode fields the Bridge evaluates
+ * (`property`/`equals`, `signal`, or the `method`/`args`/`equals` domain
+ * query). Values are JSON-serialized so the line is unambiguous. */
+function describeWaitCondition(cmd: string, params: Record<string, unknown>): string {
+  const parts: string[] = [];
+  const selector = ["test_id", "group", "path"].find((key) => params[key] !== undefined);
+  if (selector !== undefined) parts.push(`${selector}=${JSON.stringify(params[selector])}`);
+  for (const key of ["property", "signal", "method"]) {
+    if (params[key] !== undefined) parts.push(`${key}=${JSON.stringify(params[key])}`);
+  }
+  if (params["args"] !== undefined) parts.push(`args=${JSON.stringify(params["args"])}`);
+  if (params["equals"] !== undefined) parts.push(`== ${JSON.stringify(params["equals"])}`);
+  return `${cmd} ${parts.join(" ")}`;
 }
 
 function sleep(ms: number): Promise<void> {

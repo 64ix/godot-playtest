@@ -23,6 +23,12 @@ Proves, against a REAL second process (not a fake bridge):
    repeating the same doomed retry/timeout — proven by an overall wall-clock
    budget well under what a real retry at that test's (deliberately large)
    timeout would take.
+5. A hung attach trips the suite budget (ADR-0009, ticket #12):
+   `tests/runner/fixtures/suite_budget_attach/` run against an EMPTY
+   `PLAYTEST_ATTACH_PORTS` directory with `PLAYTEST_SUITE_TIMEOUT_SECONDS=1`
+   — the runner's own per-frame tick (the enforcement point for waits that
+   never reach the heartbeat tick, here `attach_instance`'s port-file poll)
+   MUST quit(1) naming the fixture's test, with no FAIL for it.
 
 Usage: test_multi_client.py <godot_bin> <project_dir>
 Exit 0 = the suite behaves exactly as documented in the fixture's own header.
@@ -203,13 +209,45 @@ def main() -> None:
         finally:
             terminate(remote_proc)
 
+    # Suite budget vs a hung attach (ADR-0009, ticket #12): the runner's own
+    # per-frame tick is the enforcement point for waits that never reach the
+    # heartbeat tick — here attach_instance's port-file poll, hanging against
+    # an empty PLAYTEST_ATTACH_PORTS directory for the whole 15s
+    # port_file_timeout. With PLAYTEST_SUITE_TIMEOUT_SECONDS=1 the runner
+    # MUST quit(1) naming the fixture's test, with no FAIL for it.
+    with tempfile.TemporaryDirectory() as empty_attach_tmp:
+        budget_env = dict(os.environ)
+        budget_env["PLAYTEST_ATTACH_PORTS"] = empty_attach_tmp
+        budget_env["PLAYTEST_SUITE_TIMEOUT_SECONDS"] = "1"
+        budget_proc = subprocess.run(
+            [
+                GODOT, "--headless", "--path", PROJECT,
+                "res://addons/playtest/runner.tscn", "--",
+                "--suite=res://tests/runner/fixtures/suite_budget_attach/",
+            ],
+            capture_output=True, text=True, timeout=60, env=budget_env,
+        )
+        budget_output = budget_proc.stdout + budget_proc.stderr
+        attach_expiry = ("suite budget exceeded (1s) while running "
+                         "res://tests/runner/fixtures/suite_budget_attach/"
+                         "suite_budget_attach_test.gd :: "
+                         "test_attach_hung_instance_exceeds_budget")
+        if budget_proc.returncode != 1:
+            failures.append(f"hung attach: expected exit=1 (budget exceeded), got exit={budget_proc.returncode}\n{budget_output}")
+        elif attach_expiry not in budget_output:
+            failures.append(f"hung attach: expiry line missing — the runner's per-frame tick must trip the budget mid-attach\n{budget_output}")
+        elif "FAIL" in budget_output:
+            failures.append(f"hung attach: no FAIL may appear for the cut-off attach (the expiry line is distinct)\n{budget_output}")
+        else:
+            print("OK hung attach_instance trips the suite budget (runner's per-frame tick)")
+
     if failures:
         print("--- FAILURES ---", file=sys.stderr)
         for f in failures:
             print(f, file=sys.stderr)
         sys.exit(1)
 
-    print("PASS 5/5")
+    print("PASS 7/7")
 
 
 if __name__ == "__main__":

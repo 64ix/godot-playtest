@@ -9,8 +9,10 @@ import { afterEach, test } from "node:test";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { ProgressNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { registerTools } from "../../src/tools.js";
 import { Session } from "../../src/session.js";
+import { createProgressReporter } from "../../src/progress.js";
 import { defaultHandler, FakeBridge } from "../helpers/fake-bridge.js";
 
 let bridge: FakeBridge | undefined;
@@ -19,10 +21,12 @@ let client: Client | undefined;
 
 async function setup(handlerOverrides: Parameters<typeof defaultHandler>[0] = {}) {
   bridge = await FakeBridge.start(defaultHandler(handlerOverrides));
-  session = new Session();
+  // The server is created first so the Session can be wired to a progress
+  // reporter that sends $/progress notifications through it (ticket #14).
+  const server = new McpServer({ name: "test-server", version: "0.0.0" });
+  session = new Session(createProgressReporter(server));
   await session.attach(bridge.port);
 
-  const server = new McpServer({ name: "test-server", version: "0.0.0" });
   registerTools(server, session);
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -108,7 +112,16 @@ test("act_invoke tool maps to cmd='act.invoke' with method/args", async () => {
 test("wait_for tool maps to cmd='wait_for' and surfaces timeout errors, not swallowed", async () => {
   const { client } = await setup({
     wait_for: (req, respond) => {
-      respond({ id: req["id"], ok: false, error: "timeout", detail: "wait_for timed out after 300ms" });
+      respond({
+        id: req["id"],
+        ok: false,
+        error: "timeout",
+        // Ticket #10: the detail names the full Condition and the last
+        // observation, appended after the existing prefix.
+        detail:
+          "wait_for timed out after 300ms — condition: {\"test_id\":\"no_such_thing\"}; " +
+          "last error: not_found no node with test_id 'no_such_thing'",
+      });
     },
   });
   const result = await client!.callTool({
@@ -118,7 +131,11 @@ test("wait_for tool maps to cmd='wait_for' and surfaces timeout errors, not swal
   assert.equal(result.isError, true);
   const payload = parseResultText(result);
   assert.equal(payload["error"], "timeout");
-  assert.equal(payload["detail"], "wait_for timed out after 300ms");
+  assert.equal(
+    payload["detail"],
+    "wait_for timed out after 300ms — condition: {\"test_id\":\"no_such_thing\"}; " +
+      "last error: not_found no node with test_id 'no_such_thing'",
+  );
 });
 
 test("not_found errors carry their suggestions through the tool result, not just ok=false", async () => {
@@ -544,5 +561,121 @@ test("calling a tool before attach/launch_game surfaces a clear error instead of
   } finally {
     server.close();
     client.close();
+  }
+});
+
+// --- Spec #9, ticket #14: agent-facing progress during long live waits ---
+
+type ProgressParams = { progressToken: string | number; progress: number; total?: number; message?: string };
+
+function collectProgress(client: Client): ProgressParams[] {
+  const notifications: ProgressParams[] = [];
+  client.setNotificationHandler(ProgressNotificationSchema, (notification) => {
+    notifications.push(notification.params);
+  });
+  return notifications;
+}
+
+function captureConsoleError(): { logs: string[]; restore: () => void } {
+  const logs: string[] = [];
+  const original = console.error;
+  console.error = (line: unknown) => logs.push(String(line));
+  return { logs, restore: () => (console.error = original) };
+}
+
+test("a slow wait_for yields periodic $/progress notifications naming the condition, plus console lines", async () => {
+  // Ticket #14: a wait spanning the heartbeat cadence must read as "in
+  // progress" (condition + elapsed/total), not as dead — via the MCP
+  // standard `$/progress` notification and the server console alike. The
+  // cadence is shortened via env so the test doesn't sleep 5s.
+  process.env.GODOT_PLAYTEST_PROGRESS_INTERVAL_MS = "40";
+  const { logs, restore } = captureConsoleError();
+  try {
+    const { client } = await setup({
+      wait_for: (req, respond) => {
+        setTimeout(() => respond({ id: req["id"], ok: true, node: { test_id: "score_label" } }), 120);
+      },
+    });
+    const notifications = collectProgress(client);
+    const result = await client!.callTool({
+      name: "wait_for",
+      arguments: { test_id: "score_label", property: "text", equals: "3", timeout_ms: 300 },
+    });
+    assert.ok(!result.isError);
+    assert.ok(notifications.length >= 2, `expected periodic ticks, got ${notifications.length}`);
+    for (const params of notifications) {
+      assert.match(String(params.progressToken), /^wait:\d+$/, "each tick carries the same opaque per-wait token");
+      assert.ok((params.message as string).includes("wait_for"), `message names the verb: ${params.message}`);
+      assert.ok(
+        (params.message as string).includes("score_label") && (params.message as string).includes("text"),
+        `message names the condition: ${params.message}`,
+      );
+      assert.equal(params.total, 300 + 2_000, "total = the client-side deadline (timeout_ms + margin)");
+      assert.ok(params.progress > 0 && params.progress < params.total!, "elapsed sits inside the deadline");
+    }
+    assert.ok(
+      notifications[0].progress < notifications[notifications.length - 1].progress,
+      "elapsed must increase across ticks",
+    );
+    const logLine = logs.find((line) => line.includes("score_label"));
+    assert.ok(logLine, "the server console logs the same progress line");
+    assert.match(logLine!, /wait_for/);
+    assert.match(logLine!, /\d+\/\d+ ms/, "the console line carries elapsed/total");
+  } finally {
+    restore();
+    delete process.env.GODOT_PLAYTEST_PROGRESS_INTERVAL_MS;
+  }
+});
+
+test("fast waits emit no $/progress notifications and no console spam", async () => {
+  // Ticket #14: a wait that resolves before the first heartbeat must stay
+  // silent — no spam on green sessions.
+  process.env.GODOT_PLAYTEST_PROGRESS_INTERVAL_MS = "40";
+  const { logs, restore } = captureConsoleError();
+  try {
+    const { client } = await setup({
+      wait_for: (req, respond) => respond({ id: req["id"], ok: true, node: { test_id: "score_label" } }),
+    });
+    const notifications = collectProgress(client);
+    const result = await client!.callTool({
+      name: "wait_for",
+      arguments: { test_id: "score_label", property: "text", equals: "3", timeout_ms: 300 },
+    });
+    assert.ok(!result.isError);
+    assert.equal(notifications.length, 0, "no $/progress when the wait resolves before the first tick");
+    assert.ok(!logs.some((line) => line.includes("wait_for")), "no console line either");
+  } finally {
+    restore();
+    delete process.env.GODOT_PLAYTEST_PROGRESS_INTERVAL_MS;
+  }
+});
+
+test("assert_eventually_property gets the same progress reporting (it reuses wait_for on the wire)", async () => {
+  // Ticket #14: the assertion path must not be special-cased — it sends a
+  // plain `wait_for`, so the progress must flow through unchanged.
+  process.env.GODOT_PLAYTEST_PROGRESS_INTERVAL_MS = "40";
+  const { restore } = captureConsoleError();
+  try {
+    const { client } = await setup({
+      wait_for: (req, respond) => {
+        setTimeout(() => respond({ id: req["id"], ok: true, node: { test_id: "player" } }), 120);
+      },
+    });
+    const notifications = collectProgress(client);
+    const result = await client!.callTool({
+      name: "assert_eventually_property",
+      arguments: { test_id: "player", property: "health", equals: 100, timeout_ms: 300 },
+    });
+    assert.ok(!result.isError);
+    assert.ok(notifications.length >= 1, "a slow assertion emits $/progress like any wait_for");
+    const params = notifications[0];
+    assert.ok(
+      (params.message as string).includes("health") && (params.message as string).includes("player"),
+      `message names the assertion's condition: ${params.message}`,
+    );
+    assert.equal(params.total, 300 + 2_000);
+  } finally {
+    restore();
+    delete process.env.GODOT_PLAYTEST_PROGRESS_INTERVAL_MS;
   }
 });

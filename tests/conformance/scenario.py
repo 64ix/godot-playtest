@@ -387,15 +387,27 @@ def check_wait_for_ambiguous(b):
 
 
 def check_wait_for_timeout_not_found(b):
+    """Ticket #10: a selector that never resolves times out with a detail
+    naming the full Condition and the last error — appended after the
+    existing prefix (`error == "timeout"` contract unchanged)."""
     r = b.call(cmd="wait_for", test_id="no_such_thing_ever", timeout_ms=300)
     assert not r["ok"], r
     assert r["error"] == "timeout", r
+    assert "wait_for timed out after 300ms" in r["detail"], r
+    assert 'condition: {"test_id":"no_such_thing_ever"}' in r["detail"], r
+    assert "last error: not_found no node with test_id 'no_such_thing_ever'" in r["detail"], r
 
 
 def check_wait_for_timeout_property_never_true(b):
+    """Ticket #10: a property never equal to `equals` times out naming the
+    full Condition and the last observed value (never re-read at the
+    deadline — carried out of the poll loop)."""
     r = b.call(cmd="wait_for", test_id="score_label", property="text", equals="never_this_value", timeout_ms=300)
     assert not r["ok"], r
     assert r["error"] == "timeout", r
+    assert "wait_for timed out after 300ms" in r["detail"], r
+    assert 'condition: {"test_id":"score_label","property":"text","equals":"never_this_value"}' in r["detail"], r
+    assert "last value: " in r["detail"], r
 
 
 def check_wait_for_missing_selector(b):
@@ -423,10 +435,28 @@ def check_wait_for_method_out_of_order(b):
 
 
 def check_wait_for_method_timeout(b):
+    """Ticket #10: a method never returning `equals` times out naming the
+    full Condition and the last return value (`score_at_least(9999)` always
+    returns false — pinned)."""
     r = b.call(cmd="wait_for", test_id="game", method="score_at_least",
                args=[9999], equals=True, timeout_ms=300)
     assert not r["ok"], r
     assert r["error"] == "timeout", r
+    # `9999.0`: JSON numbers always arrive as float on the Godot side (a
+    # documented JSON.parse_string limitation) — the condition renders what
+    # the Bridge is actually waiting on.
+    assert 'condition: {"test_id":"game","method":"score_at_least","args":[9999.0],"equals":true}' in r["detail"], r
+    assert "last return value: false" in r["detail"], r
+
+
+def check_wait_for_timeout_signal_never_fired(b):
+    """Ticket #10: a signal never emitted within `timeout_ms` times out
+    naming the full Condition and stating the signal never fired."""
+    r = b.call(cmd="wait_for", test_id="score_button", signal="pressed", timeout_ms=300)
+    assert not r["ok"], r
+    assert r["error"] == "timeout", r
+    assert 'condition: {"test_id":"score_button","signal":"pressed"}' in r["detail"], r
+    assert "signal never fired" in r["detail"], r
 
 
 def check_wait_for_method_not_found(b):
@@ -520,27 +550,48 @@ def check_step_until_timeout_property_never_true(b):
     """Budget exhaustion resolves as `timeout` (same error code as wait_for,
     §4/errors.gd) after exactly `max_frames` engine frames — the response
     carries `frames`, which a caller can check to prove the resolution is
-    frame-bounded, not wall-clock-bounded."""
+    frame-bounded, not wall-clock-bounded. Ticket #10: the detail names the
+    full Condition and last value after the pinned frame-budget prefix."""
     r = b.call(cmd="time.step_until", test_id="score_label",
                property="text", equals="never_this_value", max_frames=5)
     assert not r["ok"], r
     assert r["error"] == "timeout", r
     assert r["frames"] == 5, r
+    assert "after 5 frame(s)" in r["detail"], r
+    assert 'condition: {"test_id":"score_label","property":"text","equals":"never_this_value"}' in r["detail"], r
+    assert "last value: " in r["detail"], r
 
 
 def check_step_until_determinism(b):
     """The frame budget is exhausted after exactly `max_frames` engine frames
     on every run, independent of real elapsed wall-clock time — unlike
     wait_for's `timeout_ms` (necessarily wall-clock-variable), this must be
-    bit-for-bit identical across repeated calls (extra guardrail #5)."""
+    bit-for-bit identical across repeated calls (extra guardrail #5). The
+    condition/last-value suffix rides along on every run (ticket #10)."""
     frames_seen = []
     for _ in range(5):
         r = b.call(cmd="time.step_until", test_id="score_label",
                     property="text", equals="never_this_value", max_frames=7)
         assert not r["ok"], r
         assert r["error"] == "timeout", r
+        assert "condition:" in r["detail"] and "last value:" in r["detail"], r
         frames_seen.append(r["frames"])
     assert frames_seen == [7] * 5, frames_seen
+
+
+def check_step_until_timeout_safety_ceiling(b):
+    """Ticket #10: the optional `timeout_ms` safety ceiling (ADR-0007: never
+    the primary budget) resolves as `timeout` with the same Condition +
+    last-value suffix as the frame budget — exercised with a huge
+    `max_frames` so the wall-clock ceiling is guaranteed to fire first."""
+    r = b.call(cmd="time.step_until", test_id="score_label",
+               property="text", equals="never_this_value", max_frames=100000, timeout_ms=200)
+    assert not r["ok"], r
+    assert r["error"] == "timeout", r
+    assert isinstance(r["frames"], int), r
+    assert "safety ceiling" in r["detail"], r
+    assert 'condition: {"test_id":"score_label","property":"text","equals":"never_this_value"}' in r["detail"], r
+    assert "last value: " in r["detail"], r
 
 
 def check_step_until_resolves_after_n_frames(b):
@@ -757,6 +808,7 @@ CHECKS = [
     check_wait_for_method_out_of_order,
     check_wait_for_method_timeout,
     check_wait_for_method_not_found,
+    check_wait_for_timeout_signal_never_fired,
     check_wait_for_peer_disconnect,
     check_step_until_plain,
     check_step_until_property_out_of_order,
@@ -768,6 +820,7 @@ CHECKS = [
     check_step_until_timeout_property_never_true,
     check_step_until_determinism,
     check_step_until_resolves_after_n_frames,
+    check_step_until_timeout_safety_ceiling,
     check_step_until_peer_disconnect,
     check_screenshot,
 ]

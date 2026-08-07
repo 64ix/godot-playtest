@@ -116,6 +116,12 @@ func _connect(port_file_timeout_ms: int = 30000, connect_timeout_ms: int = 10000
 			if content.is_valid_int():
 				port = int(content)
 		if port <= 0:
+			if PlaytestCase._suite_expired:
+				# Suite budget exceeded while this attach hung (ADR-0009):
+				# silent abort — the runner's expiry line is the report, and
+				# this handle stops being usable (the suite is over).
+				_aborted = true
+				return false
 			if Time.get_ticks_msec() >= deadline_ms:
 				_fail("attach_instance(\"%s\"): timed out after %dms waiting for port-file '%s'" %
 					[_name, port_file_timeout_ms, port_file])
@@ -129,6 +135,9 @@ func _connect(port_file_timeout_ms: int = 30000, connect_timeout_ms: int = 10000
 		_peer.poll()
 		if _peer.get_status() == StreamPeerTCP.STATUS_ERROR:
 			_fail("attach_instance(\"%s\"): connection error to 127.0.0.1:%d" % [_name, port])
+			return false
+		if PlaytestCase._suite_expired:
+			_aborted = true
 			return false
 		if Time.get_ticks_msec() >= conn_deadline:
 			_fail("attach_instance(\"%s\"): timed out connecting to 127.0.0.1:%d" % [_name, port])
@@ -178,6 +187,14 @@ func _call(cmd: String, params: Dictionary = {}, timeout_ms: int = 10000) -> Dic
 		if Time.get_ticks_msec() >= deadline_ms:
 			_fail("instance '%s' did not answer '%s' within %dms" % [_name, cmd, timeout_ms])
 			return {"ok": false, "error": "instance_unavailable", "detail": "instance '%s' timed out" % _name}
+		if PlaytestCase._suite_expired:
+			# Suite budget exceeded while this round trip hung (ADR-0009):
+			# silent abort — the runner's expiry line is the report, and
+			# this handle stops being usable (the suite is over). The
+			# instance_unavailable tier makes the caller's verb recording
+			# skip its own failure entry, keeping the output expiry-only.
+			_aborted = true
+			return {"ok": false, "error": "instance_unavailable", "detail": "suite budget expired"}
 		await _owner.get_tree().process_frame
 	return {} # dead trailing return: GDScript rejects a coroutine whose every
 	# exit path is a `return` inside `while true` (research/proto-two-client-topology).

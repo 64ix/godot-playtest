@@ -242,9 +242,13 @@ func invoke(selector: Dictionary, method: String, args: Array = []) -> Variant:
 ## each in-process call is itself the failure site). `state` persists
 ## `signal` mode's connection bookkeeping (`connected`/`fired`) across calls —
 ## a `Dictionary`, passed by reference, since a plain local would reset every
-## loop iteration. Returns `{"failed": true}` for an immediate, already-recorded
-## failure (ambiguous/bad_request selector, or a missing method/signal — none
-## of which resolve themselves with more time or more steps), `{"node": Node}`
+## loop iteration — and, since spec #9 ticket #10, the last observation
+## (`last_value` in property/method mode, `last_error` while the selector
+## stays unresolved, cleared again once it resolves) so a timeout can name
+## what the poll loop saw without re-reading at the deadline. Returns
+## `{"failed": true}` for an immediate, already-recorded failure
+## (ambiguous/bad_request selector, or a missing method/signal — none of
+## which resolve themselves with more time or more steps), `{"node": Node}`
 ## once the condition is met, or `{}` while it isn't yet (including a
 ## "not_found" selector, which may still resolve later).
 func _check_condition(selector: Dictionary, mode: String, opts: Dictionary, verb: String, state: Dictionary) -> Dictionary:
@@ -253,13 +257,16 @@ func _check_condition(selector: Dictionary, mode: String, opts: Dictionary, verb
 		if res["error"] == "ambiguous" or res["error"] == "bad_request":
 			_record_selector_failure("%s(%s)" % [verb, selector], res)
 			return {"failed": true}
+		state["last_error"] = {"error": res["error"], "detail": res["detail"]}
 		return {}
 	var node: Node = res["node"]
+	state["last_error"] = {}
 	match mode:
 		"plain":
 			return {"node": node}
 		"property":
 			var actual = node.get(String(opts["property"]))
+			state["last_value"] = PlaytestVariantJson.to_json(actual)
 			if actual == opts.get("equals"):
 				return {"node": node}
 		"method":
@@ -274,6 +281,7 @@ func _check_condition(selector: Dictionary, mode: String, opts: Dictionary, verb
 				_aborted = true
 				return {"failed": true}
 			var value = node.callv(method_name, opts.get("args", []))
+			state["last_value"] = PlaytestVariantJson.to_json(value)
 			if value == opts.get("equals"):
 				return {"node": node}
 		"signal":
@@ -289,6 +297,130 @@ func _check_condition(selector: Dictionary, mode: String, opts: Dictionary, verb
 				return {"node": node}
 	return {}
 
+## The Condition (CONTEXT.md glossary) as one Dictionary — the Selector plus
+## the mode and comparison keys from `opts`, bookkeeping keys included (the
+## shared descriptor filters them). What timeout messages name (spec #9,
+## ticket #10).
+func _condition_spec(selector: Dictionary, opts: Dictionary) -> Dictionary:
+	var spec := selector.duplicate()
+	for key in opts:
+		spec[key] = opts[key]
+	return spec
+
+## Cached `PLAYTEST_HEARTBEAT_MS` (default 5000), resolved on the first
+## heartbeat tick — the interval must be tunable per invocation (a fixture
+## test needs it in the hundreds of milliseconds, not seconds), and reading
+## `OS.get_environment` once beats doing it every poll-loop iteration.
+## Negative marks "not resolved yet"; a missing, empty, or negative value
+## falls back to the 5000ms default.
+var _heartbeat_interval_ms := -1
+
+func _heartbeat_interval() -> int:
+	if _heartbeat_interval_ms < 0:
+		# Unset or unparseable values map to 0 via int("")/int("abc"), which
+		# falls through to the 5000ms default — never a per-frame spam.
+		_heartbeat_interval_ms = int(OS.get_environment("PLAYTEST_HEARTBEAT_MS"))
+		if _heartbeat_interval_ms <= 0:
+			_heartbeat_interval_ms = 5000
+	return _heartbeat_interval_ms
+
+## Suite budget (ADR-0009, ticket #12): `PLAYTEST_SUITE_TIMEOUT_SECONDS`,
+## unset = off. Static — like `PlaytestClient`'s per-invocation bookkeeping —
+## because the deadline must survive the disposable per-test `PlaytestCase`
+## instances: the runner arms it once in its `_ready()` (`_suite_deadline_ms`
+## = absolute wall-clock deadline, `_suite_budget_s` = the env value, used in
+## the expiry line) and refreshes `_suite_test_label` (the `<file> :: <method>`
+## of the test currently running) before every test. `_suite_expired` makes
+## the expiry fire exactly once: the deadline is re-checked every frame
+## (runner `_process`, wait-loop ticks) and only the first check past the
+## deadline may print.
+static var _suite_deadline_ms := 0
+static var _suite_budget_s := 0
+static var _suite_test_label := ""
+static var _suite_expired := false
+
+## The shared suite-budget check (ADR-0009, ticket #12): the deadline is
+## enforced from two places — the runner's own per-frame `_process` tick
+## (which covers the gaps between tests and every wait that never reaches
+## `_heartbeat_tick`, like a hung `attach_instance` port-file poll) and the
+## heartbeat tick below (the wait loops' shared check). Returns whether the
+## budget has expired: the expiry itself only prints the distinct line and
+## sets the flag — quitting is left to the runner's own execution points
+## (post-test / between-tests), because `get_tree().quit()` while the
+## runner's `_ready` coroutine is suspended would leak every in-flight
+## coroutine state (Godot abandons suspended states at exit) and bury the
+## expiry line under teardown noise. The cooperative aborts in the wait
+## loops and `PlaytestClient`'s poll loops unwind the running test within
+## the same frame, so the quit is still immediate in practice.
+static func _check_suite_budget() -> bool:
+	if _suite_deadline_ms > 0 and Time.get_ticks_msec() >= _suite_deadline_ms:
+		_expire_suite_budget()
+	return _suite_expired
+
+## The one suite-budget expiry (ADR-0009, ticket #12): prints the distinct
+## `[playtest-runner] suite budget exceeded (<budget>s) while running
+## <file> :: <method>` line — distinguishable from an ordinary test failure
+## by any parser — and records the flag that makes the runner quit 1 at its
+## next execution point. Idempotent: exactly one line per expired budget,
+## even though the deadline is re-checked every frame. The runner quits
+## before printing anything else for the cut-off test — no `ok`/`FAIL` line,
+## no failure details, no summary report after the expiry.
+static func _expire_suite_budget() -> void:
+	if _suite_expired:
+		return
+	_suite_expired = true
+	print("[playtest-runner] suite budget exceeded (%ds) while running %s" % [_suite_budget_s, _suite_test_label])
+
+## The shared heartbeat tick (spec #9, ticket #11): called once per poll-loop
+## iteration of `wait_for`, `time_step_until`, `assert_eventually_property`,
+## and the `assert_eventually_*` core. Emits one
+## `still waiting for <label> (<elapsed>/<total>)` line on stderr every
+## `_heartbeat_interval()` ms — threshold-based and always on, so a wait
+## shorter than the interval emits nothing and a green run stays quiet.
+## `state` persists the last emission time (`heartbeat_at_ms`) across
+## iterations — the SAME Dictionary the poll loop already uses (never a fresh
+## one, or the threshold would reset every iteration). `label` is what the
+## line names: the canonical Condition string for waits that have a Condition
+## (`PlaytestConditions.condition_json`), the assertion kind otherwise (a
+## Callable-based `assert_eventually_*` has no Condition — the Callable IS
+## the check, ADR-0006). `elapsed_label`/`total_label` are the rendered
+## budget — `(5.2/30s)` seconds, or `(152/300 frames)` for frame-budgeted
+## step waits.
+##
+## Emits via `printerr()`: the plain stderr channel, which arrives live in a
+## piped terminal and adds no `WARNING:` prefix and no backtrace (verified on
+## Godot 4.6.3 — `push_warning` does both and is unusable here). This
+## function is also the seam ADR-0009's suite-budget deadline check
+## (ticket #12) extends: every poll loop funnels through here, so the check
+## added in this one place covers all four wait families at once — each
+## loop then only needs its one-line `_suite_expired` abort after the call.
+func _heartbeat_tick(state: Dictionary, label: String, elapsed_label: String, total_label: String) -> void:
+	_check_suite_budget()
+	if _suite_expired:
+		# Suite budget exceeded (ADR-0009): the expiry line is the last
+		# line this wait emits — never a heartbeat after it, even when the
+		# deadline lands on a heartbeat-due frame (or the runner's own
+		# `_process` already printed the expiry).
+		return
+	if not state.has("heartbeat_at_ms"):
+		# First tick of this wait: anchor the interval, stay silent — the
+		# threshold counts from the wait's start, not per-iteration (a
+		# `get(key, Time.get_ticks_msec())` default would re-anchor every
+		# frame and never fire).
+		state["heartbeat_at_ms"] = Time.get_ticks_msec()
+		return
+	if Time.get_ticks_msec() - int(state["heartbeat_at_ms"]) < _heartbeat_interval():
+		return
+	state["heartbeat_at_ms"] = Time.get_ticks_msec()
+	printerr("still waiting for %s (%s/%s)" % [label, elapsed_label, total_label])
+
+## Renders a millisecond budget as the heartbeat's total: whole seconds as
+## `30s`, fractional as `0.7s` — the `(5.2/30s)` line shape.
+static func _seconds_label(ms: int) -> String:
+	if ms % 1000 == 0:
+		return "%ds" % (ms / 1000)
+	return "%.1fs" % (ms / 1000.0)
+
 ## Asynchronous `wait_for` (§4, §1.3): re-evaluates the condition every frame
 ## (`await get_tree().process_frame`) until resolution or `timeout_ms` —
 ## THE in-process anti-flake building block, never a blocking `await` on a
@@ -299,6 +431,7 @@ func wait_for(selector: Dictionary, opts: Dictionary = {}) -> Node:
 	if _aborted:
 		return null
 	var timeout_ms: int = int(opts.get("timeout_ms", 5000))
+	var started_ms := Time.get_ticks_msec()
 	var deadline_ms := Time.get_ticks_msec() + timeout_ms
 	var mode := "plain"
 	if opts.has("signal"):
@@ -307,6 +440,7 @@ func wait_for(selector: Dictionary, opts: Dictionary = {}) -> Node:
 		mode = "property"
 	elif opts.has("method"):
 		mode = "method"
+	var condition_label := PlaytestConditions.condition_json(_condition_spec(selector, opts))
 	var state := {}
 
 	while true:
@@ -316,8 +450,20 @@ func wait_for(selector: Dictionary, opts: Dictionary = {}) -> Node:
 		if res.has("node"):
 			return res["node"]
 		if Time.get_ticks_msec() >= deadline_ms:
-			_record_failure("wait_for(%s) timed out after %dms" % [selector, timeout_ms])
+			_record_failure("wait_for(%s) timed out after %dms — %s" % [
+				selector, timeout_ms,
+				PlaytestConditions.timeout_tail(_condition_spec(selector, opts), mode,
+					state.get("last_value"), state.get("last_error", {})),
+			])
 			_aborted = true
+			return null
+		_heartbeat_tick(state, condition_label,
+			"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
+			_seconds_label(timeout_ms))
+		if _suite_expired:
+			# Suite budget exceeded mid-wait (ADR-0009): the expiry line is
+			# the report — return silently, the runner quits before it
+			# prints anything for this test.
 			return null
 		await get_tree().process_frame
 	return null
@@ -374,6 +520,7 @@ func time_step_until(selector: Dictionary, opts: Dictionary = {}) -> Dictionary:
 	var max_frames: int = int(opts.get("max_frames", PlaytestDispatch.DEFAULT_STEP_UNTIL_MAX_FRAMES))
 	var start_frame: int = Engine.get_process_frames()
 	var deadline_ms := (Time.get_ticks_msec() + int(opts["timeout_ms"])) if opts.has("timeout_ms") else -1
+	var condition_label := PlaytestConditions.condition_json(_condition_spec(selector, opts))
 	var state := {}
 
 	while true:
@@ -384,12 +531,25 @@ func time_step_until(selector: Dictionary, opts: Dictionary = {}) -> Dictionary:
 		if res.has("node"):
 			return {"node": res["node"], "frames": elapsed}
 		if elapsed >= max_frames:
-			_record_failure("time_step_until(%s) exhausted its frame budget (max_frames=%d) after %d frame(s)" % [selector, max_frames, elapsed])
+			_record_failure("time_step_until(%s) exhausted its frame budget (max_frames=%d) after %d frame(s) — %s" % [
+				selector, max_frames, elapsed,
+				PlaytestConditions.timeout_tail(_condition_spec(selector, opts), mode,
+					state.get("last_value"), state.get("last_error", {})),
+			])
 			_aborted = true
 			return {"node": null, "frames": elapsed}
 		if deadline_ms >= 0 and Time.get_ticks_msec() >= deadline_ms:
-			_record_failure("time_step_until(%s) exceeded its 'timeout_ms' safety ceiling after %d frame(s)" % [selector, elapsed])
+			_record_failure("time_step_until(%s) exceeded its 'timeout_ms' safety ceiling after %d frame(s) — %s" % [
+				selector, elapsed,
+				PlaytestConditions.timeout_tail(_condition_spec(selector, opts), mode,
+					state.get("last_value"), state.get("last_error", {})),
+			])
 			_aborted = true
+			return {"node": null, "frames": elapsed}
+		_heartbeat_tick(state, condition_label, "%d" % elapsed, "%d frames" % max_frames)
+		if _suite_expired:
+			# Suite budget exceeded mid-wait (ADR-0009): silent abort — the
+			# runner quits before it prints anything for this test.
 			return {"node": null, "frames": elapsed}
 		await get_tree().process_frame
 	return {"node": null, "frames": 0}
@@ -548,7 +708,10 @@ func assert_now_property(selector: Dictionary, property: String, expected: Varia
 func assert_eventually_property(selector: Dictionary, property: String, expected: Variant, message: String = "", timeout_ms: int = DEFAULT_ASSERT_TIMEOUT_MS) -> void:
 	if _aborted:
 		return
+	var started_ms := Time.get_ticks_msec()
 	var deadline_ms := Time.get_ticks_msec() + timeout_ms
+	var condition_label := PlaytestConditions.condition_json(_condition_spec(selector, {"property": property, "equals": expected}))
+	var heartbeat_state := {}
 	while true:
 		var res := Selectors.resolve_strict(_resolution_root(), selector)
 		if res.has("error"):
@@ -566,11 +729,23 @@ func assert_eventually_property(selector: Dictionary, property: String, expected
 				_record_failure(_assert_message("assert_eventually_property", message,
 					"expected %s.%s == %s, got %s" % [selector, property, expected, actual]))
 				return
+			_heartbeat_tick(heartbeat_state, condition_label,
+				"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
+				_seconds_label(timeout_ms))
+			if _suite_expired:
+				# Suite budget exceeded mid-wait (ADR-0009): silent abort —
+				# the runner quits before it prints anything for this test.
+				return
 			await get_tree().process_frame
 			continue
 		if Time.get_ticks_msec() >= deadline_ms:
 			_record_failure(_assert_message("assert_eventually_property", message,
 				"selector %s never resolved (last: [%s] %s)" % [selector, res["error"], res["detail"]]))
+			return
+		_heartbeat_tick(heartbeat_state, condition_label,
+			"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
+			_seconds_label(timeout_ms))
+		if _suite_expired:
 			return
 		await get_tree().process_frame
 
@@ -606,13 +781,24 @@ func _assert_eventually(actual: Variant, ok: Callable, describe: Callable, own_k
 	if _aborted:
 		return
 	var getter: Callable = actual
+	var started_ms := Time.get_ticks_msec()
 	var deadline_ms := Time.get_ticks_msec() + timeout_ms
+	# No Condition exists for this family — the Callable IS the check
+	# (ADR-0006) — so the heartbeat names the assertion kind (ticket #11).
+	var heartbeat_state := {}
 	while true:
 		var value = getter.call()
 		if ok.call(value):
 			return
 		if Time.get_ticks_msec() >= deadline_ms:
 			_record_failure(_assert_message(own_kind, message, describe.call(value)))
+			return
+		_heartbeat_tick(heartbeat_state, own_kind,
+			"%.1f" % ((Time.get_ticks_msec() - started_ms) / 1000.0),
+			_seconds_label(timeout_ms))
+		if _suite_expired:
+			# Suite budget exceeded mid-wait (ADR-0009): silent abort — the
+			# runner quits before it prints anything for this test.
 			return
 		await get_tree().process_frame
 

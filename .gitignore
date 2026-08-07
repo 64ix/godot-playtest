@@ -10,3 +10,6 @@ __pycache__/
 # produced by dogfooding/setup-tps-demo.sh — never committed (large,
 # reproducible from the versioned patch).
 /.dogfood/
+
+# Implement-spec runner worktrees (cleaned up after each run)
+/.spec-worktrees/
