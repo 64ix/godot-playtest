@@ -161,8 +161,16 @@ export function registerTools(server: McpServer, session: Session): void {
         type: z.enum(["action", "key", "click"]).describe("Nature of the input to inject."),
         action: z.string().optional().describe("InputMap action name (type='action')."),
         keycode: z.number().int().optional().describe("Godot key code (type='key')."),
+        // Not `z.tuple()` (issue #23): it serialises to draft-07 tuple
+        // validation (`items` as an array of schemas), which vLLM-backed
+        // OpenAI-compatible gateways reject with a bare 400 — killing every
+        // other tool in the same payload. A length-bounded array of numbers
+        // is equivalent for an [x, y] pair and serialises to a single
+        // `items` schema. See test/unit/tool-schema-compat.test.ts.
         position: z
-          .tuple([z.number(), z.number()])
+          .array(z.number())
+          .min(2)
+          .max(2)
           .optional()
           .describe("Screen position [x, y] (type='click', 'windowed' capability only)."),
         button: z.number().int().optional().describe("MouseButton (type='click'), default left button."),
