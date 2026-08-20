@@ -1,6 +1,6 @@
 {
   "name": "godot-playtest-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Thin proxy MCP server to the godot-playtest Bridge: tools 1:1 with the protocol's verbs (docs/protocol/DRAFT-v0.md), plus launch_game/attach.",
   "license": "MIT",
   "type": "module",
